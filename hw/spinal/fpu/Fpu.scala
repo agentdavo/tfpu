@@ -1,44 +1,38 @@
 // SPDX-FileCopyrightText: 2025 David Smith <david.smith@linux.com>
 // SPDX-License-Identifier: MIT
 
-package tfpu // Updated to match your project structure (/home/davidsmith/tfpu/)
+package fpu
 
 import spinal.core._
 import spinal.lib._
 import spinal.lib.misc.pipeline._
 
-// Top-level FPU component implementing the T9000 Floating-Point Unit
 class FPU extends Component {
-  // Input/Output interface for command stream, memory access, and result output
   val io = new Bundle {
-    val cmd       = slave Stream(FpuOp())      // Command input stream for FPU operations
-    val memAddr   = out UInt(32 bits)          // Memory address for load/store operations
-    val memDataIn = in Bits(64 bits)           // Data input from memory
-    val memDataOut= out Bits(64 bits)          // Data output to memory
-    val memWrite  = out Bool()  // Write enable signal for memory
-    val result    = master Flow(Bits(64 bits)) // Result output flow (64-bit result)
-    val flags     = out(FpuFlags())            // Exception flags output
-    val trap      = out Bool()                 // Trap signal for exceptions
+    val cmd       = slave Stream(FpuOp())
+    val memAddr   = out UInt(32 bits)
+    val memDataIn = in Bits(64 bits)
+    val memDataOut= out Bits(64 bits)
+    val memWrite  = out Bool()
+    val result    = master Flow(Bits(64 bits))
+    val flags     = out(FpuFlags())
+    val trap      = out Bool()
   }
 
-  // Three-stage pipeline: Fetch, Decode, Execute
-  val fetch   = CtrlLink()    // Fetch stage for command reception
-  val decode  = CtrlLink()    // Decode stage for microcode lookup
-  val execute = CtrlLink()    // Execute stage for operation execution
-  val f2d     = StageLink(fetch.down, decode.up)   // Link between Fetch and Decode
-  val d2e     = StageLink(decode.down, execute.up) // Link between Decode and Execute
+  val fetch   = CtrlLink()
+  val decode  = CtrlLink()
+  val execute = CtrlLink()
+  val f2d     = StageLink(fetch.down, decode.up)
+  val d2e     = StageLink(decode.down, execute.up)
 
-  // Pipeline payloads
   val OPCODE    = Payload(FpuOp())
   val MICROCODE = Payload(Microcode())
   val STEP      = Payload(UInt(4 bits))
 
-  // FPU state registers
   val stack  = Vec.fill(3)(Reg(Fp64()) init Fp64().assignFromBits(0))
-  val status = Reg(FpStatus()) init FpStatus(B"01", B"00", B"00", B"00") // RNE, all single initially
+  val status = Reg(FpStatus()) init FpStatus(B"01", B"00", B"00", B"00")
   val microcode = MicrocodeRom()
 
-  // Fetch Stage
   val fetcher = new fetch.Area {
     io.cmd.ready := False
     when(io.cmd.valid) {
@@ -48,27 +42,23 @@ class FPU extends Component {
     }
   }
 
-  // Decode Stage
   val decoder = new decode.Area {
-    MICROCODE := microcode(OPCODE.asUInt) // Fixed: toUInt -> asUInt
+    MICROCODE := microcode(OPCODE.asUInt)
     io.memAddr := 0
     io.memWrite := False
   }
 
-  // Execute Stage
   val executor = new execute.Area {
     val micro = MICROCODE
     val step = STEP
     val resultReg = Reg(Fp64()) init Fp64().assignFromBits(0)
     val flagsReg = Reg(FpuFlags()) init FpuFlags().assignFromBits(0)
 
-    // Hardware units
     val adder   = new DualAdder
     val mul     = new Multiplier
     val divRoot = new DividerRooter
     val vcu     = new VCU
 
-    // Precision detection
     val isSingle = status.fpaType === B"00" && status.fpbType === B"00"
     val effectiveOp = micro.op.mux(
       FpuOp.FPADD_S      -> Mux(isSingle, FpuOp.FPADD_S, FpuOp.FPADD_D),
@@ -105,10 +95,9 @@ class FPU extends Component {
       FpuOp.FPLG_D       -> Mux(isSingle, FpuOp.FPLG_S, FpuOp.FPLG_D),
       default            -> micro.op
     )
-    val effectiveMicro = microcode(effectiveOp.asUInt) // Fixed: toUInt -> asUInt
+    val effectiveMicro = microcode(effectiveOp.asUInt)
     val effectiveStepCount = effectiveMicro.stepCount
 
-    // Connect hardware units
     adder.io.a := stack(0)
     adder.io.b := stack(1)
     adder.io.isSub := effectiveMicro.op === FpuOp.FPSUB_S || effectiveMicro.op === FpuOp.FPSUB_D
@@ -128,29 +117,32 @@ class FPU extends Component {
     vcu.io.op := effectiveMicro.op
     vcu.io.isSingle := isSingle
 
-    // Trap logic
     io.trap := effectiveMicro.trapEnable && (flagsReg.NV || flagsReg.DZ || flagsReg.OF || flagsReg.UF || flagsReg.NX)
     when(io.trap) {
       resultReg := stack(0)
     }
 
-    // Execute multi-cycle operations
     when(isValid && step < effectiveStepCount) {
-      when(vcu.io.needsNorm && step === 0) {
+      val doNorm = vcu.io.needsNorm && step === 0
+      val doBypass = vcu.io.bypass && !doNorm
+
+      when(doNorm) {
         when(stack(0).isDenorm) {
-          val shift = stack(0).mant.asUInt.leadingZerosCount.resize(6) // Fixed: added .asUInt
+          val shift = stack(0).mant.asUInt.leadingZerosCount.resize(6)
           stack(0).exp := stack(0).exp - shift
           stack(0).mant := (stack(0).mant << shift)(51 downto 0)
         }
         when(stack(1).isDenorm) {
-          val shift = stack(1).mant.asUInt.leadingZerosCount.resize(6) // Fixed: added .asUInt
+          val shift = stack(1).mant.asUInt.leadingZerosCount.resize(6)
           stack(1).exp := stack(1).exp - shift
           stack(1).mant := (stack(1).mant << shift)(51 downto 0)
         }
-      } else when(vcu.io.bypass) { // Fixed: elsewhen -> else when
-        resultReg := vcu.io.result
-        flagsReg := vcu.io.flags
-      } else { // Fixed: otherwise -> else
+      }
+
+      resultReg := Mux(doBypass, vcu.io.result, resultReg)
+      flagsReg := Mux(doBypass, vcu.io.flags, flagsReg)
+
+      when(!doNorm && !doBypass) {
         switch(effectiveMicro.op) {
           is(FpuOp.FPLDNLSN) {
             resultReg := Fp32().assignFromBits(io.memDataIn(31 downto 0)).toFp64
@@ -179,7 +171,7 @@ class FPU extends Component {
           is(FpuOp.FPLDNLADDSN) {
             when(step === 0) {
               resultReg := Fp32().assignFromBits(io.memDataIn(31 downto 0)).toFp64
-            } else {
+            }.otherwise {
               adder.io.a := resultReg
               resultReg := adder.io.result
               flagsReg := adder.io.flags
@@ -189,7 +181,7 @@ class FPU extends Component {
           is(FpuOp.FPLDNLADDDB) {
             when(step === 0) {
               resultReg := Fp64().assignFromBits(io.memDataIn)
-            } else {
+            }.otherwise {
               adder.io.a := resultReg
               resultReg := adder.io.result
               flagsReg := adder.io.flags
@@ -199,7 +191,7 @@ class FPU extends Component {
           is(FpuOp.FPLDNLMULSN) {
             when(step === 0) {
               resultReg := Fp32().assignFromBits(io.memDataIn(31 downto 0)).toFp64
-            } else {
+            }.otherwise {
               mul.io.a := resultReg
               resultReg := mul.io.result
               flagsReg := mul.io.flags
@@ -209,7 +201,7 @@ class FPU extends Component {
           is(FpuOp.FPLDNLMULDB) {
             when(step === 0) {
               resultReg := Fp64().assignFromBits(io.memDataIn)
-            } else {
+            }.otherwise {
               mul.io.a := resultReg
               resultReg := mul.io.result
               flagsReg := mul.io.flags
@@ -299,7 +291,7 @@ class FPU extends Component {
           is(FpuOp.FPCHKI32) {
             when(step === 0) {
               resultReg := stack(0)
-            } else {
+            }.otherwise {
               val intVal = resultReg.mant(31 downto 0).asSInt
               flagsReg.OF := resultReg.exp > 31
               resultReg := Fp64().assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
@@ -308,7 +300,7 @@ class FPU extends Component {
           is(FpuOp.FPCHKI64) {
             when(step === 0) {
               resultReg := stack(0)
-            } else {
+            }.otherwise {
               val intVal = resultReg.mant.asSInt
               flagsReg.OF := resultReg.exp > 63
               resultReg := Fp64().assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
@@ -317,7 +309,7 @@ class FPU extends Component {
           is(FpuOp.FPR321OR64) {
             when(step === 0) {
               resultReg := stack(0)
-            } else {
+            }.otherwise {
               resultReg := resultReg.toFp32.toFp64
               flagsReg.NX := stack(0).mant(28 downto 0) =/= 0
             }
@@ -326,7 +318,7 @@ class FPU extends Component {
           is(FpuOp.FPR64TOR32) {
             when(step === 0) {
               resultReg := stack(0)
-            } else {
+            }.otherwise {
               resultReg := resultReg.toFp32.toFp64
               flagsReg.NX := stack(0).mant(28 downto 0) =/= 0
             }
@@ -335,7 +327,7 @@ class FPU extends Component {
           is(FpuOp.FPRTOI32) {
             when(step === 0) {
               resultReg := stack(0)
-            } else {
+            }.otherwise {
               val intVal = resultReg.mant(31 downto 0).asSInt
               flagsReg.OF := resultReg.exp > 31
               resultReg := Fp64().assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
@@ -344,7 +336,7 @@ class FPU extends Component {
           is(FpuOp.FPI321OR32) {
             when(step === 0) {
               resultReg := Fp64().assignFromBits(Cat(stack(0).sign, U(127 + 31), stack(0).mant))
-            } else {
+            }.otherwise {
               resultReg := resultReg.toFp32.toFp64
               flagsReg.NX := stack(0).mant(28 downto 0) =/= 0
             }
@@ -361,7 +353,7 @@ class FPU extends Component {
           is(FpuOp.FPNOROUND) {
             when(step === 0) {
               resultReg := stack(0)
-            } else {
+            }.otherwise {
               resultReg := Fp64().assignFromBits(Cat(stack(0).sign, stack(0).exp(7 downto 0).resize(11), stack(0).mant(51 downto 29) << 29))
             }
             status.fpaType := B"00"
@@ -369,7 +361,7 @@ class FPU extends Component {
           is(FpuOp.FPINT) {
             when(step === 0) {
               resultReg := stack(0)
-            } else {
+            }.otherwise {
               val shift = 52 - resultReg.exp.asSInt
               resultReg.mant := Mux(shift < 0, resultReg.mant << shift.abs, resultReg.mant >> shift)
               resultReg.exp := U(0, 11 bits)
@@ -453,12 +445,12 @@ class FPU extends Component {
           is(FpuOp.FPRANGE_S, FpuOp.FPRANGE_D) {
             when(step === 0) {
               resultReg := stack(0)
-            } else when(step === 1) {
+            }.elseWhen(step === 1) {
               resultReg := Mux(resultReg.exp > (if (isSingle) 254 else 2046),
                 Fp64().assignFromBits(Cat(resultReg.sign, (if (isSingle) U(254, 11 bits) else U(2046)), B"0".resize(52))),
                 resultReg)
               flagsReg.OF := resultReg.exp > (if (isSingle) 254 else 2046)
-            } else when(step === 2) {
+            }.elseWhen(step === 2) {
               resultReg := Mux(resultReg.exp < 1,
                 Fp64().assignFromBits(Cat(resultReg.sign, U(1, 11 bits), B"0".resize(52))),
                 resultReg)
@@ -510,7 +502,7 @@ class FPU extends Component {
     io.result.valid := isValid && step === effectiveStepCount
     io.result.payload := resultReg.asBits
     io.flags := flagsReg
-    status.roundingMode := B"01" // Reset to RNE per ISM 11.12
+    status.roundingMode := B"01"
   }
 
   Builder(fetch, decode, execute, f2d, d2e)

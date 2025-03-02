@@ -7,513 +7,289 @@ import spinal.core._
 import spinal.lib._
 import spinal.lib.misc.pipeline._
 
-// Top-level FPU component implementing the T9000 Floating-Point Unit
-class FPU extends Component {
-  // Input/Output interface for command stream, memory access, and result output
-  val io = new Bundle {
-    val cmd       = slave Stream(FpuOp())      // Command input stream for FPU operations
-    val memAddr   = out UInt(32 bits)          // Memory address for load/store operations
-    val memDataIn = in Bits(64 bits)           // Data input from memory
-    val memDataOut= out Bits(64 bits)          // Data output to memory
-    val memWrite  = out Bool()                 // Write enable signal for memory
-    val result    = master Flow(Bits(64 bits)) // Result output flow (64-bit result)
-    val flags     = out(FpuFlags())            // Exception flags output
-    val trap      = out Bool()                 // Trap signal for exceptions
+// IEEE-754 Single Precision (32-bit)
+object Fp32 {
+  def apply(): Fp32 = new Fp32()
+  def apply(sign: Bool, exp: UInt, mant: Bits): Fp32 = {
+    val fp = new Fp32()
+    fp.sign := sign
+    fp.exp := exp
+    fp.mant := mant
+    fp
+  }
+}
+class Fp32 extends Bundle {
+  val sign = Bool()
+  val exp = UInt(8 bits)
+  val mant = Bits(23 bits)
+
+  def asBits: Bits = Cat(sign, exp, mant)
+  def isNaN: Bool = exp === 255 && mant =/= 0
+  def isInf: Bool = exp === 255 && mant === 0
+  def isZero: Bool = exp === 0 && mant === 0
+  def isDenorm: Bool = exp === 0 && mant =/= 0
+
+  def toFp64: Fp64 = {
+    val res = Fp64()
+    res.sign := sign
+    res.exp := Mux(isZero || isDenorm, U(0, 11 bits), exp.resize(11) + (1023 - 127))
+    res.mant := Mux(isDenorm, mant.resize(52), Cat(mant, B(0, 29 bits)))
+    res
+  }
+}
+
+// IEEE-754 Double Precision (64-bit)
+object Fp64 {
+  def apply(): Fp64 = new Fp64()
+  def apply(sign: Bool, exp: UInt, mant: Bits): Fp64 = {
+    val fp = new Fp64()
+    fp.sign := sign
+    fp.exp := exp
+    fp.mant := mant
+    fp
+  }
+}
+class Fp64 extends Bundle {
+  val sign = Bool()
+  val exp = UInt(11 bits)
+  val mant = Bits(52 bits)
+
+  def asBits: Bits = Cat(sign, exp, mant)
+  def isNaN: Bool = exp === 2047 && mant =/= 0
+  def isInf: Bool = exp === 2047 && mant === 0
+  def isZero: Bool = exp === 0 && mant === 0
+  def isDenorm: Bool = exp === 0 && mant =/= 0
+
+  def toFp32: Fp32 = {
+    val res = Fp32()
+    res.sign := sign
+    res.exp := Mux(exp > 127 + 255, U(255, 8 bits), exp - (1023 - 127)).resize(8)
+    res.mant := mant(51 downto 29)
+    res
   }
 
-  // Three-stage pipeline: Fetch, Decode, Execute
-  val fetch   = CtrlLink()    // Fetch stage for command reception
-  val decode  = CtrlLink()    // Decode stage for microcode lookup
-  val execute = CtrlLink()    // Execute stage for operation execution
-  val f2d     = StageLink(fetch.down, decode.up)   // Link between Fetch and Decode
-  val d2e     = StageLink(decode.down, execute.up) // Link between Decode and Execute
-
-  // Pipeline payloads for passing data between stages
-  val OPCODE    = Payload(FpuOp())      // Operation code payload
-  val MICROCODE = Payload(Microcode())  // Microcode entry payload
-  val STEP      = Payload(UInt(4 bits)) // Step counter for multi-cycle ops
-
-  // FPU state registers
-  val stack  = Vec.fill(3)(Reg(Fp64()) init Fp64().assignFromBits(0)) // Three-element evaluation stack (FA, FB, FC)
-  val status = Reg(FpStatus()) init FpStatus(B"01", B"00", B"00", B"00") // Status word (RNE, all single initially)
-
-  // Microcode ROM instance
-  val microcode = MicrocodeRom()
-
-  // Fetch Stage: Receives commands from the input stream
-  val fetcher = new fetch.Area {
-    io.cmd.ready := False
-    when(io.cmd.valid) {
-      OPCODE := io.cmd.payload
-      STEP := 0
-      io.cmd.ready := True
-    }
+  def assignFromBits(bits: Bits): Fp64 = {
+    val fp = Fp64()
+    fp.sign := bits(63)
+    fp.exp := bits(62 downto 52).asUInt
+    fp.mant := bits(51 downto 0)
+    fp
   }
+}
 
-  // Decode Stage: Looks up microcode from ROM
-  val decoder = new decode.Area {
-    MICROCODE := microcode(OPCODE.asUInt) // Fetch microcode entry using asUInt
-    io.memAddr := 0
-    io.memWrite := False
+// Rounding Modes (ISM 11.12.1, Table 11.23)
+object RoundingMode extends SpinalEnum(binarySequential) {
+  val RTZ, RNE, RUP, RDN = newElement()
+}
+
+// Exception Flags (ISM 11.13, Table 11.27)
+object FpuFlags {
+  def apply(): FpuFlags = new FpuFlags()
+}
+class FpuFlags extends Bundle {
+  val NV = Bool() // Invalid Operation
+  val NX = Bool() // Inexact
+  val OF = Bool() // Overflow
+  val UF = Bool() // Underflow
+  val DZ = Bool() // Divide by Zero
+
+  def assignFromBits(bits: Bits): FpuFlags = {
+    val flags = FpuFlags()
+    flags.NV := bits(4)
+    flags.NX := bits(3)
+    flags.OF := bits(2)
+    flags.UF := bits(1)
+    flags.DZ := bits(0)
+    flags
   }
+}
 
-  // Execute Stage: Performs operations based on microcode
-  val executor = new execute.Area {
-    val micro = MICROCODE
-    val step = STEP
-    val resultReg = Reg(Fp64()) init Fp64().assignFromBits(0)
-    val flagsReg = Reg(FpuFlags()) init FpuFlags().assignFromBits(0)
+// Floating-Point Status Word (ISM 11.12.1, Table 11.22)
+object FpStatus {
+  def apply(): FpStatus = FpStatus(B"01", B"00", B"00", B"00")
+  def apply(roundingMode: Bits, fpaType: Bits, fpbType: Bits, fpcType: Bits): FpStatus = {
+    val status = new FpStatus()
+    status.roundingMode := roundingMode
+    status.fpaType := fpaType
+    status.fpbType := fpbType
+    status.fpcType := fpcType
+    status.reserved := B(0, 24 bits)
+    status
+  }
+  def assignFromBits(bits: Bits): FpStatus = {
+    val status = new FpStatus()
+    status.roundingMode := bits(31 downto 30)
+    status.fpaType := bits(29 downto 28)
+    status.fpbType := bits(27 downto 26)
+    status.fpcType := bits(25 downto 24)
+    status.reserved := bits(23 downto 0)
+    status
+  }
+}
+class FpStatus extends Bundle {
+  val roundingMode = Bits(2 bits) // 00=RTZ, 01=RNE, 10=RUP, 11=RDN
+  val fpaType = Bits(2 bits)      // 00=single, 01=double
+  val fpbType = Bits(2 bits)
+  val fpcType = Bits(2 bits)
+  val reserved = Bits(24 bits)
 
-    // Hardware unit instances
-    val adder   = new DualAdder
-    val mul     = new Multiplier
-    val divRoot = new DividerRooter
-    val vcu     = new VCU
+  def toRoundingMode: RoundingMode.C = roundingMode.mux(
+    B"00" -> RoundingMode.RTZ,
+    B"01" -> RoundingMode.RNE,
+    B"10" -> RoundingMode.RUP,
+    B"11" -> RoundingMode.RDN
+  )
+}
 
-    // Precision detection based on stack operand types
-    val isSingle = status.fpaType === B"00" && status.fpbType === B"00"
-    val effectiveOp = micro.op.mux(
-      FpuOp.FPADD_S      -> Mux(isSingle, FpuOp.FPADD_S, FpuOp.FPADD_D),
-      FpuOp.FPADD_D      -> Mux(isSingle, FpuOp.FPADD_S, FpuOp.FPADD_D),
-      FpuOp.FPSUB_S      -> Mux(isSingle, FpuOp.FPSUB_S, FpuOp.FPSUB_D),
-      FpuOp.FPSUB_D      -> Mux(isSingle, FpuOp.FPSUB_S, FpuOp.FPSUB_D),
-      FpuOp.FPMUL_S      -> Mux(isSingle, FpuOp.FPMUL_S, FpuOp.FPMUL_D),
-      FpuOp.FPMUL_D      -> Mux(isSingle, FpuOp.FPMUL_S, FpuOp.FPMUL_D),
-      FpuOp.FPDIV_S      -> Mux(isSingle, FpuOp.FPDIV_S, FpuOp.FPDIV_D),
-      FpuOp.FPDIV_D      -> Mux(isSingle, FpuOp.FPDIV_S, FpuOp.FPDIV_D),
-      FpuOp.FPABS_S      -> Mux(isSingle, FpuOp.FPABS_S, FpuOp.FPABS_D),
-      FpuOp.FPABS_D      -> Mux(isSingle, FpuOp.FPABS_S, FpuOp.FPABS_D),
-      FpuOp.FPMULBY2_S   -> Mux(isSingle, FpuOp.FPMULBY2_S, FpuOp.FPMULBY2_D),
-      FpuOp.FPMULBY2_D   -> Mux(isSingle, FpuOp.FPMULBY2_S, FpuOp.FPMULBY2_D),
-      FpuOp.FPDIVBY2_S   -> Mux(isSingle, FpuOp.FPDIVBY2_S, FpuOp.FPDIVBY2_D),
-      FpuOp.FPDIVBY2_D   -> Mux(isSingle, FpuOp.FPDIVBY2_S, FpuOp.FPDIVBY2_D),
-      FpuOp.FPSQRT_S     -> Mux(isSingle, FpuOp.FPSQRT_S, FpuOp.FPSQRT_D),
-      FpuOp.FPSQRT_D     -> Mux(isSingle, FpuOp.FPSQRT_S, FpuOp.FPSQRT_D),
-      FpuOp.FPREM_S      -> Mux(isSingle, FpuOp.FPREM_S, FpuOp.FPREM_D),
-      FpuOp.FPREM_D      -> Mux(isSingle, FpuOp.FPREM_S, FpuOp.FPREM_D),
-      FpuOp.FPUSQRTLAST_S -> Mux(isSingle, FpuOp.FPUSQRTLAST_S, FpuOp.FPUSQRTLAST_D),
-      FpuOp.FPUSQRTLAST_D -> Mux(isSingle, FpuOp.FPUSQRTLAST_S, FpuOp.FPUSQRTLAST_D),
-      FpuOp.FPRANGE_S    -> Mux(isSingle, FpuOp.FPRANGE_S, FpuOp.FPRANGE_D),
-      FpuOp.FPRANGE_D    -> Mux(isSingle, FpuOp.FPRANGE_S, FpuOp.FPRANGE_D),
-      FpuOp.FPGT_S       -> Mux(isSingle, FpuOp.FPGT_S, FpuOp.FPGT_D),
-      FpuOp.FPGT_D       -> Mux(isSingle, FpuOp.FPGT_S, FpuOp.FPGT_D),
-      FpuOp.FPEQ_S       -> Mux(isSingle, FpuOp.FPEQ_S, FpuOp.FPEQ_D),
-      FpuOp.FPEQ_D       -> Mux(isSingle, FpuOp.FPEQ_S, FpuOp.FPEQ_D),
-      FpuOp.FPORDERED_S  -> Mux(isSingle, FpuOp.FPORDERED_S, FpuOp.FPORDERED_D),
-      FpuOp.FPORDERED_D  -> Mux(isSingle, FpuOp.FPORDERED_S, FpuOp.FPORDERED_D),
-      FpuOp.FPGE_S       -> Mux(isSingle, FpuOp.FPGE_S, FpuOp.FPGE_D),
-      FpuOp.FPGE_D       -> Mux(isSingle, FpuOp.FPGE_S, FpuOp.FPGE_D),
-      FpuOp.FPLG_S       -> Mux(isSingle, FpuOp.FPLG_S, FpuOp.FPLG_D),
-      FpuOp.FPLG_D       -> Mux(isSingle, FpuOp.FPLG_S, FpuOp.FPLG_D),
-      default            -> micro.op
-    )
-    val effectiveMicro = microcode(effectiveOp.asUInt)
-    val effectiveStepCount = effectiveMicro.stepCount
+// Full Instruction Set (ISM Tables 11.24–11.32, Section 11.12.3) with Precision Variants
+object FpuOp extends SpinalEnum(binarySequential) {
+  val NOP, FPLDNLSN, FPLDNLDB, FPLDNLSNI, FPLDNLDBI, FPLDZEROSN, FPLDZERODB,
+  FPLDNLADDSN, FPLDNLADDDB, FPLDNLMULSN, FPLDNLMULDB, FPSTNLSN, FPSTNLDB,
+  FPSTNLI32, FPENTRY, FPREV, FPDUP, FPRN, FPRZ, FPRP, FPRM, FPCHKERR,
+  FPTESTERR, FPSETERR, FPCLRERR,
+  FPGT_S, FPGT_D, FPEQ_S, FPEQ_D, FPORDERED_S, FPORDERED_D, FPNAN, FPNOTFINITE,
+  FPCHKI32, FPCHKI64, FPR321OR64, FPR64TOR32, FPRTOI32, FPI321OR32, FPI321OR64,
+  FPB321OR64, FPNOROUND, FPINT,
+  FPADD_S, FPADD_D, FPSUB_S, FPSUB_D, FPMUL_S, FPMUL_D, FPDIV_S, FPDIV_D,
+  FPABS_S, FPABS_D, FPEXPINC32, FPEXPDEC32, FPMULBY2_S, FPMULBY2_D,
+  FPDIVBY2_S, FPDIVBY2_D, FPUSQRTFIRST, FPUSQRTSTEP, FPUSQRTLAST_S, FPUSQRTLAST_D,
+  FPREMFIRST, FPREMSTEP, FPREM_S, FPREM_D, FPSQRT_S, FPSQRT_D,
+  FPRANGE_S, FPRANGE_D, FPGE_S, FPGE_D, FPLG_S, FPLG_D, FPSTALL, FPLDALL = newElement()
+}
 
-    // Connect hardware units
-    adder.io.a := stack(0)
-    adder.io.b := stack(1)
-    adder.io.isSub := effectiveMicro.op === FpuOp.FPSUB_S || effectiveMicro.op === FpuOp.FPSUB_D
-    adder.io.roundingMode := status.toRoundingMode
-    adder.io.isSingle := isSingle
-    mul.io.a := stack(0)
-    mul.io.b := stack(1)
-    mul.io.roundingMode := status.toRoundingMode
-    mul.io.isSingle := isSingle
-    divRoot.io.a := stack(0)
-    divRoot.io.b := stack(1)
-    divRoot.io.isDiv := effectiveMicro.op === FpuOp.FPDIV_S || effectiveMicro.op === FpuOp.FPDIV_D
-    divRoot.io.roundingMode := status.toRoundingMode
-    divRoot.io.isSingle := isSingle
-    vcu.io.a := stack(0)
-    vcu.io.b := stack(1)
-    vcu.io.op := effectiveMicro.op
-    vcu.io.isSingle := isSingle
+// Microcode Definition without isSingle (precision encoded in opcode)
+object Microcode {
+  // Default instance for Mem initialization (NOP, 0 cycles, no action)
+  def apply(): Microcode = Microcode(FpuOp.NOP, 0, B"000", False, False, True)
+  
+  // Full constructor for specific microcode entries
+  def apply(op: FpuOp.E, stepCount: Int, unit: Bits, pushStack: Bool, popStack: Bool, trapEnable: Bool): Microcode = {
+    val micro = new Microcode()
+    micro.op := op
+    micro.stepCount := stepCount
+    micro.unit := unit
+    micro.pushStack := pushStack
+    micro.popStack := popStack
+    micro.trapEnable := trapEnable
+    micro
+  }
+}
+class Microcode extends Bundle {
+  val op = FpuOp()
+  val stepCount = UInt(4 bits)
+  val unit = Bits(3 bits)
+  val pushStack = Bool()
+  val popStack = Bool()
+  val trapEnable = Bool()
+}
 
-    // Trap logic
-    io.trap := effectiveMicro.trapEnable && (flagsReg.NV || flagsReg.DZ || flagsReg.OF || flagsReg.UF || flagsReg.NX)
-    when(io.trap) {
-      resultReg := stack(0)
-    }
-
-    // Execute multi-cycle operations
-    when(isValid && step < effectiveStepCount) {
-      when(vcu.io.needsNorm && step === 0) {
-        when(stack(0).isDenorm) {
-          val shift = stack(0).mant.asUInt.leadingZerosCount.resize(6)
-          stack(0).exp := stack(0).exp - shift
-          stack(0).mant := (stack(0).mant << shift)(51 downto 0)
-        }
-        when(stack(1).isDenorm) {
-          val shift = stack(1).mant.asUInt.leadingZerosCount.resize(6)
-          stack(1).exp := stack(1).exp - shift
-          stack(1).mant := (stack(1).mant << shift)(51 downto 0)
-        }
-      } else when(vcu.io.bypass) {
-        resultReg := vcu.io.result
-        flagsReg := vcu.io.flags
-      } else {
-        switch(effectiveMicro.op) {
-          is(FpuOp.FPLDNLSN) {
-            resultReg := Fp32().assignFromBits(io.memDataIn(31 downto 0)).toFp64
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPLDNLDB) {
-            resultReg := Fp64().assignFromBits(io.memDataIn)
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPLDNLSNI) {
-            resultReg := Fp32().assignFromBits(io.memDataIn(31 downto 0)).toFp64
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPLDNLDBI) {
-            resultReg := Fp64().assignFromBits(io.memDataIn)
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPLDZEROSN) {
-            resultReg := Fp64().assignFromBits(0)
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPLDZERODB) {
-            resultReg := Fp64().assignFromBits(0)
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPLDNLADDSN) {
-            when(step === 0) {
-              resultReg := Fp32().assignFromBits(io.memDataIn(31 downto 0)).toFp64
-            } else {
-              adder.io.a := resultReg
-              resultReg := adder.io.result
-              flagsReg := adder.io.flags
-            }
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPLDNLADDDB) {
-            when(step === 0) {
-              resultReg := Fp64().assignFromBits(io.memDataIn)
-            } else {
-              adder.io.a := resultReg
-              resultReg := adder.io.result
-              flagsReg := adder.io.flags
-            }
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPLDNLMULSN) {
-            when(step === 0) {
-              resultReg := Fp32().assignFromBits(io.memDataIn(31 downto 0)).toFp64
-            } else {
-              mul.io.a := resultReg
-              resultReg := mul.io.result
-              flagsReg := mul.io.flags
-            }
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPLDNLMULDB) {
-            when(step === 0) {
-              resultReg := Fp64().assignFromBits(io.memDataIn)
-            } else {
-              mul.io.a := resultReg
-              resultReg := mul.io.result
-              flagsReg := mul.io.flags
-            }
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPSTNLSN) {
-            io.memDataOut := stack(0).toFp32.asBits.resize(64)
-            io.memWrite := True
-          }
-          is(FpuOp.FPSTNLDB) {
-            io.memDataOut := stack(0).asBits
-            io.memWrite := True
-          }
-          is(FpuOp.FPSTNLI32) {
-            io.memDataOut := stack(0).mant(31 downto 0).asSInt.asBits.resize(64)
-            io.memWrite := True
-          }
-          is(FpuOp.FPENTRY) {
-            resultReg := Fp64().assignFromBits(io.memDataIn)
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPREV) {
-            val temp = stack(0)
-            stack(0) := stack(1)
-            stack(1) := temp
-            val tempType = status.fpaType
-            status.fpaType := status.fpbType
-            status.fpbType := tempType
-          }
-          is(FpuOp.FPDUP) {
-            resultReg := stack(0)
-          }
-          is(FpuOp.FPRN) {
-            status.roundingMode := B"01"
-          }
-          is(FpuOp.FPRZ) {
-            status.roundingMode := B"00"
-          }
-          is(FpuOp.FPRP) {
-            status.roundingMode := B"10"
-          }
-          is(FpuOp.FPRM) {
-            status.roundingMode := B"11"
-          }
-          is(FpuOp.FPCHKERR) {
-            resultReg := Fp64().assignFromBits(Cat(flagsReg.asBits.resize(52), U"0".resize(11), flagsReg.NV).asBits)
-          }
-          is(FpuOp.FPTESTERR) {
-            flagsReg.NV := False
-            flagsReg.NX := False
-            flagsReg.OF := False
-            flagsReg.UF := False
-            flagsReg.DZ := False
-          }
-          is(FpuOp.FPSETERR) {
-            flagsReg.NV := True
-          }
-          is(FpuOp.FPCLRERR) {
-            flagsReg.NV := False
-            flagsReg.NX := False
-            flagsReg.OF := False
-            flagsReg.UF := False
-            flagsReg.DZ := False
-          }
-          is(FpuOp.FPGT_S, FpuOp.FPGT_D) {
-            adder.io.isSub := True
-            val diff = adder.io.result
-            resultReg := Fp64().assignFromBits(Cat(diff.sign, U"0".resize(11), B"0".resize(52)))
-            flagsReg := adder.io.flags
-          }
-          is(FpuOp.FPEQ_S, FpuOp.FPEQ_D) {
-            adder.io.isSub := True
-            val diff = adder.io.result
-            resultReg := Fp64().assignFromBits(Cat(~diff.isZero, U"0".resize(11), B"0".resize(52)))
-            flagsReg := adder.io.flags
-          }
-          is(FpuOp.FPORDERED_S, FpuOp.FPORDERED_D) {
-            resultReg := Fp64().assignFromBits(Cat(~(stack(0).isNaN || stack(1).isNaN), U"0".resize(11), B"0".resize(52)))
-          }
-          is(FpuOp.FPNAN) {
-            resultReg := Fp64().assignFromBits(Cat(stack(0).isNaN, U"0".resize(11), B"0".resize(52)))
-          }
-          is(FpuOp.FPNOTFINITE) {
-            resultReg := Fp64().assignFromBits(Cat(stack(0).isInf || stack(0).isNaN, U"0".resize(11), B"0".resize(52)))
-          }
-          is(FpuOp.FPCHKI32) {
-            when(step === 0) {
-              resultReg := stack(0)
-            } else {
-              val intVal = resultReg.mant(31 downto 0).asSInt
-              flagsReg.OF := resultReg.exp > 31
-              resultReg := Fp64().assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
-            }
-          }
-          is(FpuOp.FPCHKI64) {
-            when(step === 0) {
-              resultReg := stack(0)
-            } else {
-              val intVal = resultReg.mant.asSInt
-              flagsReg.OF := resultReg.exp > 63
-              resultReg := Fp64().assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
-            }
-          }
-          is(FpuOp.FPR321OR64) {
-            when(step === 0) {
-              resultReg := stack(0)
-            } else {
-              resultReg := resultReg.toFp32.toFp64
-              flagsReg.NX := stack(0).mant(28 downto 0) =/= 0
-            }
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPR64TOR32) {
-            when(step === 0) {
-              resultReg := stack(0)
-            } else {
-              resultReg := resultReg.toFp32.toFp64
-              flagsReg.NX := stack(0).mant(28 downto 0) =/= 0
-            }
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPRTOI32) {
-            when(step === 0) {
-              resultReg := stack(0)
-            } else {
-              val intVal = resultReg.mant(31 downto 0).asSInt
-              flagsReg.OF := resultReg.exp > 31
-              resultReg := Fp64().assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
-            }
-          }
-          is(FpuOp.FPI321OR32) {
-            when(step === 0) {
-              resultReg := Fp64().assignFromBits(Cat(stack(0).sign, U(127 + 31), stack(0).mant))
-            } else {
-              resultReg := resultReg.toFp32.toFp64
-              flagsReg.NX := stack(0).mant(28 downto 0) =/= 0
-            }
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPI321OR64) {
-            resultReg := Fp64().assignFromBits(Cat(stack(0).sign, U(1023 + 31), stack(0).mant))
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPB321OR64) {
-            resultReg := Fp64().assignFromBits(stack(0).asBits)
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPNOROUND) {
-            when(step === 0) {
-              resultReg := stack(0)
-            } else {
-              resultReg := Fp64().assignFromBits(Cat(stack(0).sign, stack(0).exp(7 downto 0).resize(11), stack(0).mant(51 downto 29) << 29))
-            }
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPINT) {
-            when(step === 0) {
-              resultReg := stack(0)
-            } else {
-              val shift = 52 - resultReg.exp.asSInt
-              resultReg.mant := Mux(shift < 0, resultReg.mant << shift.abs, resultReg.mant >> shift)
-              resultReg.exp := U(0, 11 bits)
-            }
-          }
-          is(FpuOp.FPADD_S, FpuOp.FPADD_D) {
-            resultReg := adder.io.result
-            flagsReg := adder.io.flags
-          }
-          is(FpuOp.FPSUB_S, FpuOp.FPSUB_D) {
-            resultReg := adder.io.result
-            flagsReg := adder.io.flags
-          }
-          is(FpuOp.FPMUL_S, FpuOp.FPMUL_D) {
-            resultReg := mul.io.result
-            flagsReg := mul.io.flags
-          }
-          is(FpuOp.FPDIV_S, FpuOp.FPDIV_D) {
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPABS_S, FpuOp.FPABS_D) {
-            resultReg := stack(0)
-            resultReg.sign := False
-          }
-          is(FpuOp.FPEXPINC32) {
-            resultReg := stack(0)
-            resultReg.exp := stack(0).exp + 32
-            flagsReg.OF := resultReg.exp > 254
-          }
-          is(FpuOp.FPEXPDEC32) {
-            resultReg := stack(0)
-            resultReg.exp := stack(0).exp - 32
-            flagsReg.UF := resultReg.exp < 1
-          }
-          is(FpuOp.FPMULBY2_S, FpuOp.FPMULBY2_D) {
-            resultReg := stack(0)
-            resultReg.exp := stack(0).exp + 1
-            flagsReg.OF := resultReg.exp > (if (isSingle) 254 else 2046)
-          }
-          is(FpuOp.FPDIVBY2_S, FpuOp.FPDIVBY2_D) {
-            resultReg := stack(0)
-            resultReg.exp := stack(0).exp - 1
-            flagsReg.UF := resultReg.exp < 1
-          }
-          is(FpuOp.FPUSQRTFIRST) {
-            divRoot.io.isDiv := False
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPUSQRTSTEP) {
-            divRoot.io.isDiv := False
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPUSQRTLAST_S, FpuOp.FPUSQRTLAST_D) {
-            divRoot.io.isDiv := False
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPREMFIRST) {
-            divRoot.io.isDiv := True
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPREMSTEP) {
-            divRoot.io.isDiv := True
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPREM_S, FpuOp.FPREM_D) {
-            divRoot.io.isDiv := True
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPSQRT_S, FpuOp.FPSQRT_D) {
-            divRoot.io.isDiv := False
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPRANGE_S, FpuOp.FPRANGE_D) {
-            when(step === 0) {
-              resultReg := stack(0)
-            } else when(step === 1) {
-              resultReg := Mux(resultReg.exp > (if (isSingle) 254 else 2046),
-                Fp64().assignFromBits(Cat(resultReg.sign, (if (isSingle) U(254, 11 bits) else U(2046)), B"0".resize(52))),
-                resultReg)
-              flagsReg.OF := resultReg.exp > (if (isSingle) 254 else 2046)
-            } else when(step === 2) {
-              resultReg := Mux(resultReg.exp < 1,
-                Fp64().assignFromBits(Cat(resultReg.sign, U(1, 11 bits), B"0".resize(52))),
-                resultReg)
-              flagsReg.UF := resultReg.exp < 1
-            }
-          }
-          is(FpuOp.FPGE_S, FpuOp.FPGE_D) {
-            adder.io.isSub := True
-            val diff = adder.io.result
-            resultReg := Fp64().assignFromBits(Cat(~(diff.sign || diff.isZero), U"0".resize(11), B"0".resize(52)))
-            flagsReg := adder.io.flags
-          }
-          is(FpuOp.FPLG_S, FpuOp.FPLG_D) {
-            adder.io.isSub := True
-            val diff = adder.io.result
-            resultReg := Fp64().assignFromBits(Cat(diff.sign && !diff.isZero, U"0".resize(11), B"0".resize(52)))
-            flagsReg := adder.io.flags
-          }
-          is(FpuOp.FPSTALL) {
-            io.memDataOut := stack(0).asBits
-            io.memWrite := True
-          }
-          is(FpuOp.FPLDALL) {
-            resultReg := Fp64().assignFromBits(io.memDataIn)
-            status := FpStatus.assignFromBits(io.memDataIn(31 downto 0))
-          }
-        }
-      }
-
-      when(effectiveMicro.pushStack) {
-        stack(2) := stack(1)
-        stack(1) := stack(0)
-        stack(0) := resultReg
-        status.fpcType := status.fpbType
-        status.fpbType := status.fpaType
-        status.fpaType := Mux(isSingle, B"00", B"01")
-      }
-      when(effectiveMicro.popStack) {
-        stack(0) := stack(1)
-        stack(1) := stack(2)
-        stack(2).assignFromBits(0)
-        status.fpaType := status.fpbType
-        status.fpbType := status.fpcType
-        status.fpcType := B"00"
-      }
-      STEP := step + 1
+// Fully Populated Microcode ROM with Detailed Comments
+object MicrocodeRom {
+  def apply(): Mem[Microcode] = {
+    val rom = Mem(Microcode(), 750) // 750 entries (~24,000 bits), exceeds ~12,000-bit T9000 spec for flexibility
+    def set(op: FpuOp.E, steps: Int, unit: Bits, push: Bool, pop: Bool, trap: Bool = True): Unit = {
+      rom.write(
+        address = op.toUInt,
+        data = Microcode(op, steps, unit, push, pop, trap)
+      )
     }
 
-    io.result.valid := isValid && step === effectiveStepCount
-    io.result.payload := resultReg.asBits
-    io.flags := flagsReg
-    status.roundingMode := B"01"
-  }
+    // Load/Store Operations (ISM Table 11.24)
+    set(FpuOp.FPLDNLSN,     1, B"000", True,  False) // Load non-local single from memory, push to stack (1 cycle, no unit)
+    set(FpuOp.FPLDNLDB,     1, B"000", True,  False) // Load non-local double from memory, push to stack (1 cycle, no unit)
+    set(FpuOp.FPLDNLSNI,    1, B"000", True,  False) // Load non-local indexed single from memory, push to stack (1 cycle, no unit)
+    set(FpuOp.FPLDNLDBI,    1, B"000", True,  False) // Load non-local indexed double from memory, push to stack (1 cycle, no unit)
+    set(FpuOp.FPLDZEROSN,   1, B"000", True,  False) // Push single-precision zero (0.0) to stack (1 cycle, no unit)
+    set(FpuOp.FPLDZERODB,   1, B"000", True,  False) // Push double-precision zero (0.0) to stack (1 cycle, no unit)
+    set(FpuOp.FPLDNLADDSN,  2, B"001", True,  False) // Load non-local single and add to stack top, push result (2 cycles, adder unit)
+    set(FpuOp.FPLDNLADDDB,  2, B"001", True,  False) // Load non-local double and add to stack top, push result (2 cycles, adder unit)
+    set(FpuOp.FPLDNLMULSN,  2, B"010", True,  False) // Load non-local single and multiply with stack top, push result (2 cycles, multiplier unit)
+    set(FpuOp.FPLDNLMULDB,  3, B"010", True,  False) // Load non-local double and multiply with stack top, push result (3 cycles, multiplier unit)
+    set(FpuOp.FPSTNLSN,     1, B"000", False, True)  // Store single-precision stack top to memory, pop stack (1 cycle, no unit)
+    set(FpuOp.FPSTNLDB,     1, B"000", False, True)  // Store double-precision stack top to memory, pop stack (1 cycle, no unit)
+    set(FpuOp.FPSTNLI32,    1, B"000", False, True)  // Store int32 from stack top to memory, pop stack (1 cycle, no unit)
 
-  Builder(fetch, decode, execute, f2d, d2e)
+    // General Operations (ISM Table 11.25)
+    set(FpuOp.FPENTRY,      1, B"000", True,  False) // FPU entry, push initialization value (1 cycle, no unit)
+    set(FpuOp.FPREV,        1, B"000", False, False) // Reverse top two stack elements (FA and FB), no push/pop (1 cycle, no unit)
+    set(FpuOp.FPDUP,        1, B"000", True,  False) // Duplicate stack top (FA), push duplicate (1 cycle, no unit)
+
+    // Rounding Operations (ISM Table 11.26)
+    set(FpuOp.FPRN,         1, B"000", False, False) // Set rounding mode to nearest (RNE), update status (1 cycle, no unit)
+    set(FpuOp.FPRZ,         1, B"000", False, False) // Set rounding mode to zero (RTZ), update status (1 cycle, no unit)
+    set(FpuOp.FPRP,         1, B"000", False, False) // Set rounding mode to positive (RUP), update status (1 cycle, no unit)
+    set(FpuOp.FPRM,         1, B"000", False, False) // Set rounding mode to minus (RDN), update status (1 cycle, no unit)
+
+    // Error Operations (ISM Table 11.27)
+    set(FpuOp.FPCHKERR,     1, B"000", True,  False) // Check FP error, push status flags to stack (1 cycle, no unit)
+    set(FpuOp.FPTESTERR,    1, B"000", False, False) // Test FP error and clear flags, no stack change (1 cycle, no unit)
+    set(FpuOp.FPSETERR,     1, B"000", False, False) // Set FP error flag, no stack change (1 cycle, no unit)
+    set(FpuOp.FPCLRERR,     1, B"000", False, False) // Clear FP error flags, no stack change (1 cycle, no unit)
+
+    // Comparison Operations (ISM Table 11.28)
+    set(FpuOp.FPGT_S,       1, B"001", True,  True)  // Single-precision greater than, pop 2, push result (1 cycle, adder unit)
+    set(FpuOp.FPGT_D,       1, B"001", True,  True)  // Double-precision greater than, pop 2, push result (1 cycle, adder unit)
+    set(FpuOp.FPEQ_S,       1, B"001", True,  True)  // Single-precision equality, pop 2, push result (1 cycle, adder unit)
+    set(FpuOp.FPEQ_D,       1, B"001", True,  True)  // Double-precision equality, pop 2, push result (1 cycle, adder unit)
+    set(FpuOp.FPORDERED_S,  1, B"001", True,  True)  // Single-precision orderability, pop 2, push result (1 cycle, adder unit)
+    set(FpuOp.FPORDERED_D,  1, B"001", True,  True)  // Double-precision orderability, pop 2, push result (1 cycle, adder unit)
+    set(FpuOp.FPNAN,        1, B"000", True,  True)  // Check NaN on stack top, pop, push result (1 cycle, no unit)
+    set(FpuOp.FPNOTFINITE,  1, B"000", True,  True)  // Check not finite on stack top, pop, push result (1 cycle, no unit)
+    set(FpuOp.FPCHKI32,     2, B"001", True,  True)  // Check int32 range, pop, push result (2 cycles, adder unit)
+    set(FpuOp.FPCHKI64,     2, B"001", True,  True)  // Check int64 range, pop, push result (2 cycles, adder unit)
+
+    // Conversion Operations (ISM Table 11.29)
+    set(FpuOp.FPR321OR64,   2, B"001", True,  True)  // Convert real32 to real64, pop, push result (2 cycles, adder unit)
+    set(FpuOp.FPR64TOR32,   2, B"001", True,  True)  // Convert real64 to real32, pop, push result (2 cycles, adder unit)
+    set(FpuOp.FPRTOI32,     2, B"001", True,  True)  // Convert real to int32, pop, push result (2 cycles, adder unit)
+    set(FpuOp.FPI321OR32,   2, B"001", True,  True)  // Convert int32 to real32, pop, push result (2 cycles, adder unit)
+    set(FpuOp.FPI321OR64,   2, B"001", True,  True)  // Convert int32 to real64, pop, push result (2 cycles, adder unit)
+    set(FpuOp.FPB321OR64,   2, B"001", True,  True)  // Convert bit32 to real64, pop, push result (2 cycles, adder unit)
+    set(FpuOp.FPNOROUND,    2, B"001", True,  True)  // Convert real64 to real32 without rounding, pop, push result (2 cycles, adder unit)
+    set(FpuOp.FPINT,        2, B"001", True,  True)  // Truncate to integer, pop, push result (2 cycles, adder unit)
+
+    // Arithmetic Operations (ISM Table 11.30)
+    set(FpuOp.FPADD_S,      2, B"001", True,  True)  // Single-precision add, pop 2, push result (2 cycles, adder unit)
+    set(FpuOp.FPADD_D,      2, B"001", True,  True)  // Double-precision add, pop 2, push result (2 cycles, adder unit)
+    set(FpuOp.FPSUB_S,      2, B"001", True,  True)  // Single-precision subtract, pop 2, push result (2 cycles, adder unit)
+    set(FpuOp.FPSUB_D,      2, B"001", True,  True)  // Double-precision subtract, pop 2, push result (2 cycles, adder unit)
+    set(FpuOp.FPMUL_S,      2, B"010", True,  True)  // Single-precision multiply, pop 2, push result (2 cycles, multiplier unit)
+    set(FpuOp.FPMUL_D,      3, B"010", True,  True)  // Double-precision multiply, pop 2, push result (3 cycles, multiplier unit)
+    set(FpuOp.FPDIV_S,      7, B"100", True,  True)  // Single-precision divide, pop 2, push result (7 cycles, divider unit)
+    set(FpuOp.FPDIV_D,     15, B"100", True,  True)  // Double-precision divide, pop 2, push result (15 cycles, divider unit)
+    set(FpuOp.FPABS_S,      1, B"001", True,  True)  // Single-precision absolute, pop, push result (1 cycle, adder unit)
+    set(FpuOp.FPABS_D,      1, B"001", True,  True)  // Double-precision absolute, pop, push result (1 cycle, adder unit)
+    set(FpuOp.FPEXPINC32,   2, B"001", True,  True)  // Multiply single-precision by 2^32, pop, push result (2 cycles, adder unit)
+    set(FpuOp.FPEXPDEC32,   2, B"001", True,  True)  // Divide single-precision by 2^32, pop, push result (2 cycles, adder unit)
+    set(FpuOp.FPMULBY2_S,   2, B"010", True,  True)  // Single-precision multiply by 2.0, pop, push result (2 cycles, multiplier unit)
+    set(FpuOp.FPMULBY2_D,   2, B"010", True,  True)  // Double-precision multiply by 2.0, pop, push result (2 cycles, multiplier unit)
+    set(FpuOp.FPDIVBY2_S,   2, B"100", True,  True)  // Single-precision divide by 2.0, pop, push result (2 cycles, divider unit)
+    set(FpuOp.FPDIVBY2_D,   2, B"100", True,  True)  // Double-precision divide by 2.0, pop, push result (2 cycles, divider unit)
+
+    // Compatibility Operations (ISM Table 11.31)
+    set(FpuOp.FPUSQRTFIRST, 2, B"100", False, False) // Square root first step, no stack change (2 cycles, divider unit)
+    set(FpuOp.FPUSQRTSTEP,  2, B"100", False, False) // Square root step, no stack change (2 cycles, divider unit)
+    set(FpuOp.FPUSQRTLAST_S, 7, B"100", True, True)  // Single-precision square root last step, pop, push result (7 cycles, divider unit)
+    set(FpuOp.FPUSQRTLAST_D,15, B"100", True, True)  // Double-precision square root last step, pop, push result (15 cycles, divider unit)
+    set(FpuOp.FPREMFIRST,   5, B"100", False, False) // Remainder first step, no stack change (5 cycles, divider unit)
+    set(FpuOp.FPREMSTEP,    2, B"100", False, False) // Remainder step, no stack change (2 cycles, divider unit)
+
+    // Additional Operations (ISM Table 11.32)
+    set(FpuOp.FPREM_S,      7, B"100", True,  True)  // Single-precision remainder, pop 2, push result (7 cycles, divider unit)
+    set(FpuOp.FPREM_D,     15, B"100", True,  True)  // Double-precision remainder, pop 2, push result (15 cycles, divider unit)
+    set(FpuOp.FPSQRT_S,     7, B"100", True,  True)  // Single-precision square root, pop, push result (7 cycles, divider unit)
+    set(FpuOp.FPSQRT_D,    15, B"100", True,  True)  // Double-precision square root, pop, push result (15 cycles, divider unit)
+    set(FpuOp.FPRANGE_S,    5, B"001", True,  True)  // Single-precision range reduce, pop, push result (5 cycles, adder unit)
+    set(FpuOp.FPRANGE_D,    5, B"001", True,  True)  // Double-precision range reduce, pop, push result (5 cycles, adder unit)
+    set(FpuOp.FPGE_S,       1, B"001", True,  True)  // Single-precision greater or equal, pop 2, push result (1 cycle, adder unit)
+    set(FpuOp.FPGE_D,       1, B"001", True,  True)  // Double-precision greater or equal, pop 2, push result (1 cycle, adder unit)
+    set(FpuOp.FPLG_S,       1, B"001", True,  True)  // Single-precision less or greater, pop 2, push result (1 cycle, adder unit)
+    set(FpuOp.FPLG_D,       1, B"001", True,  True)  // Double-precision less or greater, pop 2, push result (1 cycle, adder unit)
+
+    // State Saving (ISM 11.12.3)
+    set(FpuOp.FPSTALL,      1, B"000", False, True)  // Store all state to memory, pop stack (1 cycle, no unit)
+    set(FpuOp.FPLDALL,      1, B"000", True,  False) // Load all state from memory, push to stack (1 cycle, no unit)
+
+    rom
+  }
 }
