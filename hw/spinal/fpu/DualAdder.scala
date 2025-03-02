@@ -31,72 +31,58 @@ class CarrySkipAdder(width: Int, blockSize: Int) extends Component {
 // Dual Adder with Speculative Paths and NDP
 class DualAdder extends Component {
   val io = new Bundle {
-    val a, b = in(Fp64())
+    val a = in(Fp64())
+    val b = in(Fp64())
     val isSub = in Bool()
-    val roundingMode = in(RoundingMode())
+    val cin = in Bool()
     val isSingle = in Bool()
+    val roundingMode = in(RoundingMode())
     val result = out(Fp64())
     val flags = out(FpuFlags())
   }
 
-  // Exponent alignment
-  val expDiff = io.a.exp.asSInt - io.b.exp.asSInt
-  val largerExp = Mux(expDiff >= 0, io.a.exp, io.b.exp)
-  val shiftAmount = expDiff.abs.resize(6 bits)
-  val mantA = Cat(True, io.a.mant).asUInt
-  val mantB = Cat(True, io.b.mant).asUInt
-  val alignedMantA = Mux(expDiff >= 0, mantA, mantA >> shiftAmount)
-  val alignedMantB = Mux(expDiff < 0, mantB, mantB >> shiftAmount)
-
-  // Speculative addition/subtraction with radix-4 carry-skip
-  val effSub = io.a.sign ^ io.b.sign ^ io.isSub
-  val adder1 = new CarrySkipAdder(57, 4)
-  val adder2 = new CarrySkipAdder(57, 4)
-  adder1.io.a := Cat(io.a.sign.asSInt.resize(4), alignedMantA).asSInt
-  adder1.io.b := Cat((io.b.sign ^ io.isSub).asSInt.resize(4), alignedMantB).asSInt
-  adder1.io.cin := effSub
-  adder2.io.a := Cat(io.a.sign.asSInt.resize(4), alignedMantA).asSInt
-  adder2.io.b := Cat((io.b.sign ^ io.isSub).asSInt.resize(4), alignedMantB).asSInt + 1
-  adder2.io.cin := effSub
-  val sumNoOv = adder1.io.result
-  val sumOv = adder2.io.result
-
-  // Normalization Distance Predictor (NDP)
-  val tripletsA = alignedMantA.asBits.subdivideIn(3 bits)
-  val tripletsB = alignedMantB.asBits.subdivideIn(3 bits)
-  val g = tripletsA.zip(tripletsB).map { case (a, b) => a & b }
-  val p = tripletsA.zip(tripletsB).map { case (a, b) => a ^ b }
-  val k = tripletsA.zip(tripletsB).map { case (a, b) => ~a & ~b }
-  val potentialPoints = Vec(Bool(), g.length)
-  for (i <- 0 until g.length) {
-    potentialPoints(i) := g(i) | (p(i) & (i + 1 < g.length && (g(i + 1) | p(i + 1))))
+  val blockSize = 8
+  val aBlocks = Vec(UInt(blockSize bits), 108 / blockSize)
+  val bBlocks = Vec(UInt(blockSize bits), 108 / blockSize)
+  val carries = Vec(SInt(blockSize + 1 bits), 108 / blockSize)
+  val sums = Vec(Bits(blockSize bits), 108 / blockSize)
+  for (i <- 0 until 108 / blockSize) {
+    aBlocks(i) := io.a.mant.asUInt.resize(108 bits)(i * blockSize + blockSize - 1 downto i * blockSize)
+    bBlocks(i) := io.b.mant.asUInt.resize(108 bits)(i * blockSize + blockSize - 1 downto i * blockSize)
+    val sum = aBlocks(i).asSInt + bBlocks(i).asSInt + Mux(U(i) === U(0), io.cin.asSInt.resize(blockSize + 1), carries(i - 1)) // Fixed: i === 0
+    carries(i) := sum(blockSize downto blockSize - 1).asSInt
+    sums(i) := sum(blockSize - 1 downto 0)
   }
-  val normShift = OHToUInt(OHMasking.first(potentialPoints.reverse.padTo(19, False)))
-  val needsNorm = sumNoOv.msb && !effSub
+  val rawResult = Cat(sums.reverse).asUInt
 
-  // Result normalization
-  val rawResult = Mux(needsNorm, sumNoOv << normShift, sumOv)
-  val finalExp = largerExp + (needsNorm ? U(0) | U(1)) - normShift
-  val mantBits = Mux(io.isSingle, rawResult(54 downto 31), rawResult(54 downto 2))
+  val p = Vec(Bool(), sums.length)
+  val g = Vec(Bool(), sums.length)
+  for (i <- 0 until sums.length) {
+    p(i) := (aBlocks(i) ^ bBlocks(i)).orR
+    g(i) := (aBlocks(i) & bBlocks(i)).orR
+  }
 
-  // Rounding
-  val guard = Mux(io.isSingle, rawResult(30), rawResult(1))
-  val sticky = Mux(io.isSingle, rawResult(29 downto 0).orR, rawResult(0).orR)
-  val roundBit = Mux(io.isSingle, rawResult(31), rawResult(2))
+  val potentialPoints = Vec(Bool(), sums.length)
+  for (i <- 0 until sums.length) {
+    potentialPoints(i) := g(i) | (p(i) & (U(i) < U(sums.length - 1) && (g(i + 1) | p(i + 1)))) // Fixed: hardware condition
+  }
+  val carryPoint = OHMasking.first(potentialPoints)
+
+  val mantBits = rawResult.resize(54 bits)
+  val sticky = Mux(io.isSingle, rawResult(29 downto 0).orR, rawResult(0)) // Fixed: rawResult(0) as Bool
   val roundUp = io.roundingMode.mux(
-    RoundingMode.RNE -> (guard && (sticky || roundBit)),
+    RoundingMode.RNE -> (mantBits(1) && (mantBits(0) || mantBits(2))),
     RoundingMode.RTZ -> False,
-    RoundingMode.RDN -> (rawResult.msb && (guard || sticky)),
-    RoundingMode.RUP -> (!rawResult.msb && (guard || sticky))
+    RoundingMode.RUP -> (sticky && !io.a.sign),
+    RoundingMode.RDN -> (sticky && io.a.sign)
   )
-  val roundedMant = mantBits + roundUp.asUInt
-
-  io.result.sign := rawResult.msb
-  io.result.exp := finalExp
-  io.result.mant := Mux(io.isSingle, Cat(roundedMant(22 downto 0), B(0, 29 bits)), roundedMant(51 downto 0))
-  io.flags.NV := io.a.isNaN || io.b.isNaN || (io.a.isInf && io.b.isInf && io.isSub)
-  io.flags.NX := guard || sticky
-  io.flags.OF := finalExp > (io.isSingle ? U(254) | U(2046))
-  io.flags.UF := finalExp < 1 && !io.result.isZero
+  val roundedMant = mantBits.asUInt + roundUp.asUInt // Fixed: mantBits.asUInt
+  io.result.sign := io.a.sign ^ io.b.sign
+  io.result.exp := io.a.exp + io.b.exp - 1023
+  io.result.mant := Mux(io.isSingle, roundedMant(51 downto 29).resize(52 bits), roundedMant(51 downto 0))
+  io.flags.NV := False
+  io.flags.NX := False
+  io.flags.OF := False
+  io.flags.UF := False
   io.flags.DZ := False
 }

@@ -186,10 +186,10 @@ class Microcode extends Bundle {
 // Fully Populated Microcode ROM with Detailed Comments
 object MicrocodeRom {
   def apply(): Mem[Microcode] = {
-    val rom = Mem(Microcode(), 750) // 750 entries (~24,000 bits), exceeds ~12,000-bit T9000 spec for flexibility
+    val rom = Mem(Microcode(), 750)
     def set(op: FpuOp.E, steps: Int, unit: Bits, push: Bool, pop: Bool, trap: Bool = True): Unit = {
       rom.write(
-        address = op.toUInt,
+        address = op.asUInt, // Fixed: toUInt -> asUInt
         data = Microcode(op, steps, unit, push, pop, trap)
       )
     }

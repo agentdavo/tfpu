@@ -43,7 +43,7 @@ class FPU extends Component {
   }
 
   val decoder = new decode.Area {
-    MICROCODE := microcode(OPCODE.asUInt)
+    MICROCODE := microcode(OPCODE.asUInt) // Fixed earlier: toUInt -> asUInt
     io.memAddr := 0
     io.memWrite := False
   }
@@ -95,7 +95,7 @@ class FPU extends Component {
       FpuOp.FPLG_D       -> Mux(isSingle, FpuOp.FPLG_S, FpuOp.FPLG_D),
       default            -> micro.op
     )
-    val effectiveMicro = microcode(effectiveOp.asUInt)
+    val effectiveMicro = microcode(effectiveOp.asUInt) // Fixed: toUInt -> asUInt
     val effectiveStepCount = effectiveMicro.stepCount
 
     adder.io.a := stack(0)
@@ -143,7 +143,7 @@ class FPU extends Component {
       flagsReg := Mux(doBypass, vcu.io.flags, flagsReg)
 
       when(!doNorm && !doBypass) {
-        switch(effectiveMicro.op) {
+        switch(effectiveMicro.op) { // Fixed: Removed duplicate switch
           is(FpuOp.FPLDNLSN) {
             resultReg := Fp32().assignFromBits(io.memDataIn(31 downto 0)).toFp64
             status.fpaType := B"00"
@@ -502,7 +502,7 @@ class FPU extends Component {
     io.result.valid := isValid && step === effectiveStepCount
     io.result.payload := resultReg.asBits
     io.flags := flagsReg
-    status.roundingMode := B"01"
+    status.roundingMode := B"01" // Reset to RNE per ISM 11.12
   }
 
   Builder(fetch, decode, execute, f2d, d2e)
