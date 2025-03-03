@@ -29,7 +29,7 @@ class FPU extends Component {
   val MICROCODE = Payload(Microcode())
   val STEP      = Payload(UInt(4 bits))
 
-  val stack  = Vec.fill(3)(Reg(Fp64()) init Fp64().assignFromBits(0))
+  val stack  = Vec.fill(3)(Reg(Fp64()) init { val temp = Fp64(); temp.assignFromBits(0); temp })  // Updated init
   val status = Reg(FpStatus()) init FpStatus(B"01", B"00", B"00", B"00")
   val microcode = MicrocodeRom()
 
@@ -43,7 +43,7 @@ class FPU extends Component {
   }
 
   val decoder = new decode.Area {
-    MICROCODE := microcode(OPCODE.asUInt) // Fixed earlier: toUInt -> asUInt
+    MICROCODE := microcode(OPCODE.asBits.asUInt)
     io.memAddr := 0
     io.memWrite := False
   }
@@ -51,13 +51,13 @@ class FPU extends Component {
   val executor = new execute.Area {
     val micro = MICROCODE
     val step = STEP
-    val resultReg = Reg(Fp64()) init Fp64().assignFromBits(0)
-    val flagsReg = Reg(FpuFlags()) init FpuFlags().assignFromBits(0)
+    val resultReg = Reg(Fp64()) init { val temp = Fp64(); temp.assignFromBits(0); temp }  // Updated init
+    val flagsReg = Reg(FpuFlags()) init { val temp = FpuFlags(); temp.assignFromBits(0); temp }  // Updated init
 
-    val adder   = new DualAdder
-    val mul     = new Multiplier
+    val adder = new DualAdder
+    val mul = new Multiplier
     val divRoot = new DividerRooter
-    val vcu     = new VCU
+    val vcu = new VCU
 
     val isSingle = status.fpaType === B"00" && status.fpbType === B"00"
     val effectiveOp = micro.op.mux(
@@ -95,7 +95,7 @@ class FPU extends Component {
       FpuOp.FPLG_D       -> Mux(isSingle, FpuOp.FPLG_S, FpuOp.FPLG_D),
       default            -> micro.op
     )
-    val effectiveMicro = microcode(effectiveOp.asUInt) // Fixed: toUInt -> asUInt
+    val effectiveMicro = microcode(effectiveOp.asBits.asUInt)
     val effectiveStepCount = effectiveMicro.stepCount
 
     adder.io.a := stack(0)
@@ -128,12 +128,12 @@ class FPU extends Component {
 
       when(doNorm) {
         when(stack(0).isDenorm) {
-          val shift = stack(0).mant.asUInt.leadingZerosCount.resize(6)
+          val shift = CountOne(stack(0).mant.asUInt).resize(6)
           stack(0).exp := stack(0).exp - shift
           stack(0).mant := (stack(0).mant << shift)(51 downto 0)
         }
         when(stack(1).isDenorm) {
-          val shift = stack(1).mant.asUInt.leadingZerosCount.resize(6)
+          val shift = CountOne(stack(1).mant.asUInt).resize(6)
           stack(1).exp := stack(1).exp - shift
           stack(1).mant := (stack(1).mant << shift)(51 downto 0)
         }
@@ -143,34 +143,48 @@ class FPU extends Component {
       flagsReg := Mux(doBypass, vcu.io.flags, flagsReg)
 
       when(!doNorm && !doBypass) {
-        switch(effectiveMicro.op) { // Fixed: Removed duplicate switch
+        switch(effectiveMicro.op) {
           is(FpuOp.FPLDNLSN) {
-            resultReg := Fp32().assignFromBits(io.memDataIn(31 downto 0)).toFp64
+            val fp32Temp = Fp32()
+            fp32Temp.assignFromBits(io.memDataIn(31 downto 0))
+            resultReg := fp32Temp.toFp64
             status.fpaType := B"00"
           }
           is(FpuOp.FPLDNLDB) {
-            resultReg := Fp64().assignFromBits(io.memDataIn)
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(io.memDataIn)
+            resultReg := fp64Temp
             status.fpaType := B"01"
           }
           is(FpuOp.FPLDNLSNI) {
-            resultReg := Fp32().assignFromBits(io.memDataIn(31 downto 0)).toFp64
+            val fp32Temp = Fp32()
+            fp32Temp.assignFromBits(io.memDataIn(31 downto 0))
+            resultReg := fp32Temp.toFp64
             status.fpaType := B"00"
           }
           is(FpuOp.FPLDNLDBI) {
-            resultReg := Fp64().assignFromBits(io.memDataIn)
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(io.memDataIn)
+            resultReg := fp64Temp
             status.fpaType := B"01"
           }
           is(FpuOp.FPLDZEROSN) {
-            resultReg := Fp64().assignFromBits(0)
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(0)
+            resultReg := fp64Temp
             status.fpaType := B"00"
           }
           is(FpuOp.FPLDZERODB) {
-            resultReg := Fp64().assignFromBits(0)
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(0)
+            resultReg := fp64Temp
             status.fpaType := B"01"
           }
           is(FpuOp.FPLDNLADDSN) {
             when(step === 0) {
-              resultReg := Fp32().assignFromBits(io.memDataIn(31 downto 0)).toFp64
+              val fp32Temp = Fp32()
+              fp32Temp.assignFromBits(io.memDataIn(31 downto 0))
+              resultReg := fp32Temp.toFp64
             }.otherwise {
               adder.io.a := resultReg
               resultReg := adder.io.result
@@ -180,7 +194,9 @@ class FPU extends Component {
           }
           is(FpuOp.FPLDNLADDDB) {
             when(step === 0) {
-              resultReg := Fp64().assignFromBits(io.memDataIn)
+              val fp64Temp = Fp64()
+              fp64Temp.assignFromBits(io.memDataIn)
+              resultReg := fp64Temp
             }.otherwise {
               adder.io.a := resultReg
               resultReg := adder.io.result
@@ -190,7 +206,9 @@ class FPU extends Component {
           }
           is(FpuOp.FPLDNLMULSN) {
             when(step === 0) {
-              resultReg := Fp32().assignFromBits(io.memDataIn(31 downto 0)).toFp64
+              val fp32Temp = Fp32()
+              fp32Temp.assignFromBits(io.memDataIn(31 downto 0))
+              resultReg := fp32Temp.toFp64
             }.otherwise {
               mul.io.a := resultReg
               resultReg := mul.io.result
@@ -200,7 +218,9 @@ class FPU extends Component {
           }
           is(FpuOp.FPLDNLMULDB) {
             when(step === 0) {
-              resultReg := Fp64().assignFromBits(io.memDataIn)
+              val fp64Temp = Fp64()
+              fp64Temp.assignFromBits(io.memDataIn)
+              resultReg := fp64Temp
             }.otherwise {
               mul.io.a := resultReg
               resultReg := mul.io.result
@@ -221,7 +241,9 @@ class FPU extends Component {
             io.memWrite := True
           }
           is(FpuOp.FPENTRY) {
-            resultReg := Fp64().assignFromBits(io.memDataIn)
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(io.memDataIn)
+            resultReg := fp64Temp
             status.fpaType := B"01"
           }
           is(FpuOp.FPREV) {
@@ -248,7 +270,9 @@ class FPU extends Component {
             status.roundingMode := B"11"
           }
           is(FpuOp.FPCHKERR) {
-            resultReg := Fp64().assignFromBits(Cat(flagsReg.asBits.resize(52), U"0".resize(11), flagsReg.NV).asBits)
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(Cat(flagsReg.asBits.resize(52), U"0".resize(11), flagsReg.NV))
+            resultReg := fp64Temp
           }
           is(FpuOp.FPTESTERR) {
             flagsReg.NV := False
@@ -270,23 +294,33 @@ class FPU extends Component {
           is(FpuOp.FPGT_S, FpuOp.FPGT_D) {
             adder.io.isSub := True
             val diff = adder.io.result
-            resultReg := Fp64().assignFromBits(Cat(diff.sign, U"0".resize(11), B"0".resize(52)))
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(Cat(diff.sign, U"0".resize(11), B"0".resize(52)))
+            resultReg := fp64Temp
             flagsReg := adder.io.flags
           }
           is(FpuOp.FPEQ_S, FpuOp.FPEQ_D) {
             adder.io.isSub := True
             val diff = adder.io.result
-            resultReg := Fp64().assignFromBits(Cat(~diff.isZero, U"0".resize(11), B"0".resize(52)))
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(Cat(~diff.isZero, U"0".resize(11), B"0".resize(52)))
+            resultReg := fp64Temp
             flagsReg := adder.io.flags
           }
           is(FpuOp.FPORDERED_S, FpuOp.FPORDERED_D) {
-            resultReg := Fp64().assignFromBits(Cat(~(stack(0).isNaN || stack(1).isNaN), U"0".resize(11), B"0".resize(52)))
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(Cat(~(stack(0).isNaN || stack(1).isNaN), U"0".resize(11), B"0".resize(52)))
+            resultReg := fp64Temp
           }
           is(FpuOp.FPNAN) {
-            resultReg := Fp64().assignFromBits(Cat(stack(0).isNaN, U"0".resize(11), B"0".resize(52)))
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(Cat(stack(0).isNaN, U"0".resize(11), B"0".resize(52)))
+            resultReg := fp64Temp
           }
           is(FpuOp.FPNOTFINITE) {
-            resultReg := Fp64().assignFromBits(Cat(stack(0).isInf || stack(0).isNaN, U"0".resize(11), B"0".resize(52)))
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(Cat(stack(0).isInf || stack(0).isNaN, U"0".resize(11), B"0".resize(52)))
+            resultReg := fp64Temp
           }
           is(FpuOp.FPCHKI32) {
             when(step === 0) {
@@ -294,7 +328,9 @@ class FPU extends Component {
             }.otherwise {
               val intVal = resultReg.mant(31 downto 0).asSInt
               flagsReg.OF := resultReg.exp > 31
-              resultReg := Fp64().assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
+              val fp64Temp = Fp64()
+              fp64Temp.assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
+              resultReg := fp64Temp
             }
           }
           is(FpuOp.FPCHKI64) {
@@ -303,7 +339,9 @@ class FPU extends Component {
             }.otherwise {
               val intVal = resultReg.mant.asSInt
               flagsReg.OF := resultReg.exp > 63
-              resultReg := Fp64().assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
+              val fp64Temp = Fp64()
+              fp64Temp.assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
+              resultReg := fp64Temp
             }
           }
           is(FpuOp.FPR321OR64) {
@@ -330,12 +368,16 @@ class FPU extends Component {
             }.otherwise {
               val intVal = resultReg.mant(31 downto 0).asSInt
               flagsReg.OF := resultReg.exp > 31
-              resultReg := Fp64().assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
+              val fp64Temp = Fp64()
+              fp64Temp.assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
+              resultReg := fp64Temp
             }
           }
           is(FpuOp.FPI321OR32) {
             when(step === 0) {
-              resultReg := Fp64().assignFromBits(Cat(stack(0).sign, U(127 + 31), stack(0).mant))
+              val fp64Temp = Fp64()
+              fp64Temp.assignFromBits(Cat(stack(0).sign, U(127 + 31), stack(0).mant))
+              resultReg := fp64Temp
             }.otherwise {
               resultReg := resultReg.toFp32.toFp64
               flagsReg.NX := stack(0).mant(28 downto 0) =/= 0
@@ -343,18 +385,24 @@ class FPU extends Component {
             status.fpaType := B"00"
           }
           is(FpuOp.FPI321OR64) {
-            resultReg := Fp64().assignFromBits(Cat(stack(0).sign, U(1023 + 31), stack(0).mant))
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(Cat(stack(0).sign, U(1023 + 31), stack(0).mant))
+            resultReg := fp64Temp
             status.fpaType := B"01"
           }
           is(FpuOp.FPB321OR64) {
-            resultReg := Fp64().assignFromBits(stack(0).asBits)
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(stack(0).asBits)
+            resultReg := fp64Temp
             status.fpaType := B"01"
           }
           is(FpuOp.FPNOROUND) {
             when(step === 0) {
               resultReg := stack(0)
             }.otherwise {
-              resultReg := Fp64().assignFromBits(Cat(stack(0).sign, stack(0).exp(7 downto 0).resize(11), stack(0).mant(51 downto 29) << 29))
+              val fp64Temp = Fp64()
+              fp64Temp.assignFromBits(Cat(stack(0).sign, stack(0).exp(7 downto 0).resize(11), stack(0).mant(51 downto 29) << 29))
+              resultReg := fp64Temp
             }
             status.fpaType := B"00"
           }
@@ -362,8 +410,12 @@ class FPU extends Component {
             when(step === 0) {
               resultReg := stack(0)
             }.otherwise {
-              val shift = 52 - resultReg.exp.asSInt
-              resultReg.mant := Mux(shift < 0, resultReg.mant << shift.abs, resultReg.mant >> shift)
+              val shift = S(52) - resultReg.exp.asSInt
+              when(shift < 0) {
+                resultReg.mant := resultReg.mant << shift.abs
+              }.otherwise {
+                resultReg.mant := resultReg.mant >> shift.asUInt
+              }
               resultReg.exp := U(0, 11 bits)
             }
           }
@@ -400,7 +452,7 @@ class FPU extends Component {
           is(FpuOp.FPMULBY2_S, FpuOp.FPMULBY2_D) {
             resultReg := stack(0)
             resultReg.exp := stack(0).exp + 1
-            flagsReg.OF := resultReg.exp > (if (isSingle) 254 else 2046)
+            flagsReg.OF := resultReg.exp > Mux(isSingle, U(254), U(2046))
           }
           is(FpuOp.FPDIVBY2_S, FpuOp.FPDIVBY2_D) {
             resultReg := stack(0)
@@ -445,28 +497,36 @@ class FPU extends Component {
           is(FpuOp.FPRANGE_S, FpuOp.FPRANGE_D) {
             when(step === 0) {
               resultReg := stack(0)
-            }.elseWhen(step === 1) {
-              resultReg := Mux(resultReg.exp > (if (isSingle) 254 else 2046),
-                Fp64().assignFromBits(Cat(resultReg.sign, (if (isSingle) U(254, 11 bits) else U(2046)), B"0".resize(52))),
-                resultReg)
-              flagsReg.OF := resultReg.exp > (if (isSingle) 254 else 2046)
-            }.elseWhen(step === 2) {
-              resultReg := Mux(resultReg.exp < 1,
-                Fp64().assignFromBits(Cat(resultReg.sign, U(1, 11 bits), B"0".resize(52))),
-                resultReg)
-              flagsReg.UF := resultReg.exp < 1
+            } otherwise {
+              when(step === 1) {
+                resultReg := Mux(resultReg.exp > Mux(isSingle, U(254), U(2046)),
+                  { val temp = Fp64(); temp.assignFromBits(Cat(resultReg.sign, Mux(isSingle, U(254, 11 bits), U(2046)), B"0".resize(52))); temp },
+                  resultReg)
+                flagsReg.OF := resultReg.exp > Mux(isSingle, U(254), U(2046))
+              } otherwise {
+                when(step === 2) {
+                  resultReg := Mux(resultReg.exp < 1,
+                    { val temp = Fp64(); temp.assignFromBits(Cat(resultReg.sign, U(1, 11 bits), B"0".resize(52))); temp },
+                    resultReg)
+                  flagsReg.UF := resultReg.exp < 1
+                }
+              }
             }
           }
           is(FpuOp.FPGE_S, FpuOp.FPGE_D) {
             adder.io.isSub := True
             val diff = adder.io.result
-            resultReg := Fp64().assignFromBits(Cat(~(diff.sign || diff.isZero), U"0".resize(11), B"0".resize(52)))
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(Cat(~(diff.sign || diff.isZero), U"0".resize(11), B"0".resize(52)))
+            resultReg := fp64Temp
             flagsReg := adder.io.flags
           }
           is(FpuOp.FPLG_S, FpuOp.FPLG_D) {
             adder.io.isSub := True
             val diff = adder.io.result
-            resultReg := Fp64().assignFromBits(Cat(diff.sign && !diff.isZero, U"0".resize(11), B"0".resize(52)))
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(Cat(diff.sign && !diff.isZero, U"0".resize(11), B"0".resize(52)))
+            resultReg := fp64Temp
             flagsReg := adder.io.flags
           }
           is(FpuOp.FPSTALL) {
@@ -474,7 +534,9 @@ class FPU extends Component {
             io.memWrite := True
           }
           is(FpuOp.FPLDALL) {
-            resultReg := Fp64().assignFromBits(io.memDataIn)
+            val fp64Temp = Fp64()
+            fp64Temp.assignFromBits(io.memDataIn)
+            resultReg := fp64Temp
             status := FpStatus.assignFromBits(io.memDataIn(31 downto 0))
           }
         }
@@ -491,7 +553,9 @@ class FPU extends Component {
       when(effectiveMicro.popStack) {
         stack(0) := stack(1)
         stack(1) := stack(2)
-        stack(2).assignFromBits(0)
+        val temp = Fp64()
+        temp.assignFromBits(0)
+        stack(2) := temp
         status.fpaType := status.fpbType
         status.fpbType := status.fpcType
         status.fpcType := B"00"

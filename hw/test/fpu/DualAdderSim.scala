@@ -20,7 +20,7 @@ object DualAdderSim {
       dut.io.roundingMode #= RoundingMode.RNE
       dut.io.isSingle #= false
       dut.clockDomain.waitSampling(2)
-      val result1 = dut.io.result.payload.toBigInt
+      val result1 = dut.io.result.asBits.toBigInt  // Changed to asBits
       assert(result1 == BigInt("4008000000000000", 16), s"Add failed: $result1")
 
       // Test 2: Sub 3.0 - 1.0 (single)
@@ -33,7 +33,7 @@ object DualAdderSim {
       dut.io.isSub #= true
       dut.io.isSingle #= true
       dut.clockDomain.waitSampling(2)
-      val result2 = dut.io.result.payload.toBigInt
+      val result2 = dut.io.result.asBits.toBigInt  // Changed to asBits
       assert(result2 == BigInt("4000000000000000", 16), s"Sub failed: $result2")
 
       println("DualAdder tests passed!")

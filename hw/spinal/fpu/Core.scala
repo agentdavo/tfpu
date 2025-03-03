@@ -23,7 +23,8 @@ class Fp32 extends Bundle {
   val exp = UInt(8 bits)
   val mant = Bits(23 bits)
 
-  def asBits: Bits = Cat(sign, exp, mant)
+  override def asBits: Bits = Cat(sign, exp, mant)  // Added override
+
   def isNaN: Bool = exp === 255 && mant =/= 0
   def isInf: Bool = exp === 255 && mant === 0
   def isZero: Bool = exp === 0 && mant === 0
@@ -54,7 +55,8 @@ class Fp64 extends Bundle {
   val exp = UInt(11 bits)
   val mant = Bits(52 bits)
 
-  def asBits: Bits = Cat(sign, exp, mant)
+  override def asBits: Bits = Cat(sign, exp, mant)  // Added override
+
   def isNaN: Bool = exp === 2047 && mant =/= 0
   def isInf: Bool = exp === 2047 && mant === 0
   def isZero: Bool = exp === 0 && mant === 0
@@ -68,12 +70,10 @@ class Fp64 extends Bundle {
     res
   }
 
-  def assignFromBits(bits: Bits): Fp64 = {
-    val fp = Fp64()
-    fp.sign := bits(63)
-    fp.exp := bits(62 downto 52).asUInt
-    fp.mant := bits(51 downto 0)
-    fp
+  override def assignFromBits(bits: Bits): Unit = {  // Changed to Unit, added override
+    sign := bits(63)
+    exp := bits(62 downto 52).asUInt
+    mant := bits(51 downto 0)
   }
 }
 
@@ -93,14 +93,12 @@ class FpuFlags extends Bundle {
   val UF = Bool() // Underflow
   val DZ = Bool() // Divide by Zero
 
-  def assignFromBits(bits: Bits): FpuFlags = {
-    val flags = FpuFlags()
-    flags.NV := bits(4)
-    flags.NX := bits(3)
-    flags.OF := bits(2)
-    flags.UF := bits(1)
-    flags.DZ := bits(0)
-    flags
+  override def assignFromBits(bits: Bits): Unit = {  // Changed to Unit, added override
+    NV := bits(4)
+    NX := bits(3)
+    OF := bits(2)
+    UF := bits(1)
+    DZ := bits(0)
   }
 }
 
@@ -189,7 +187,7 @@ object MicrocodeRom {
     val rom = Mem(Microcode(), 750)
     def set(op: FpuOp.E, steps: Int, unit: Bits, push: Bool, pop: Bool, trap: Bool = True): Unit = {
       rom.write(
-        address = op.asUInt, // Fixed: toUInt -> asUInt
+        address = op.asBits.asUInt,
         data = Microcode(op, steps, unit, push, pop, trap)
       )
     }

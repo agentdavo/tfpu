@@ -3,7 +3,7 @@ package fpu
 import spinal.core._
 import spinal.core.sim._
 
-object VCUSim {
+object VcuSim {
   def main(args: Array[String]): Unit = {
     SimConfig.withWave.compile(new VCU).doSim { dut =>
       dut.clockDomain.forkStimulus(period = 20)
@@ -16,10 +16,10 @@ object VCUSim {
       dut.io.b.sign #= false
       dut.io.b.exp #= 1023
       dut.io.b.mant #= BigInt("0" * 52, 2)
-      dut.io.op #= FpuOp.FPDIV
+      dut.io.op #= FpuOp.FPDIV_D  // Changed to FPDIV_D
       dut.io.isSingle #= false
       dut.clockDomain.waitSampling()
-      val result1 = dut.io.result.payload.toBigInt
+      val result1 = dut.io.result.asBits.toBigInt  // Changed to asBits
       assert(result1 == BigInt("7FF8000000000000", 16), s"NaN failed: $result1")
       assert(dut.io.flags.NV.toBoolean, "NV flag not set for NaN")
 
@@ -32,7 +32,7 @@ object VCUSim {
       dut.io.b.mant #= BigInt("0" * 52, 2)
       dut.io.isSingle #= true
       dut.clockDomain.waitSampling()
-      val result2 = dut.io.result.payload.toBigInt
+      val result2 = dut.io.result.asBits.toBigInt  // Changed to asBits
       assert(result2 == BigInt("7F80000000000000", 16), s"Inf failed: $result2")
       assert(dut.io.flags.DZ.toBoolean, "DZ flag not set for div by zero")
 

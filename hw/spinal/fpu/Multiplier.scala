@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2025 David Smith <david.smith@linux.com>
-// SPDX-License-Identifier: MIT
-
 package fpu
 
 import spinal.core._
@@ -8,74 +5,94 @@ import spinal.lib._
 
 class Multiplier extends Component {
   val io = new Bundle {
-    val a = in(Fp64())           // First operand (FA)
-    val b = in(Fp64())           // Second operand (FB)
-    val isSingle = in Bool()     // True for single-precision (FPMUL_S), False for double (FPMUL_D)
-    val roundingMode = in(RoundingMode()) // T9000 rounding mode (RNE, RTZ, RUP, RDN)
-    val result = out(Fp64())     // Result pushed to stack
-    val flags = out(FpuFlags())  // T9000 exception flags
+    val a = in(Fp64())
+    val b = in(Fp64())
+    val isSingle = in Bool()
+    val roundingMode = in(RoundingMode())
+    val result = out(Fp64())
+    val flags = out(FpuFlags())
   }
 
-  // Booth multiplier for raw product
-  val booth = new BoothMultiplier(io.a.asBits, io.b.asBits)
-  val mantA = booth.io.mantA.resize(108 bits) // Extended for precision
-  val mantB = booth.io.mantB.resize(108 bits)
+  // Pipeline Stage 1: Input Handling
+  val stage1 = new Area {
+    val mantA = Reg(UInt(53 bits)) init(0)  // Implicit '1' + 52-bit mantissa
+    val mantB = Reg(UInt(53 bits)) init(0)
+    val expA = Reg(SInt(11 bits)) init(0)
+    val expB = Reg(SInt(11 bits)) init(0)
+    val signA = Reg(Bool()) init(False)
+    val signB = Reg(Bool()) init(False)
+    val isSingleReg = Reg(Bool()) init(False)
+    val roundingModeReg = Reg(RoundingMode()) init(RoundingMode.RNE)
 
-  // CSA reduction for multiplication
-  val csa1 = Vec(UInt(108 bits), 5)
-  val csa2 = Vec(UInt(108 bits), 5)
-  for (i <- 0 to 4) {
-    val s1 = mantA(107 - i * 2 downto 0).asUInt
-    val c1 = (mantA(107 - i * 2 - 1 downto 0) & mantB).resize(108 bits).asUInt
-    val s2 = mantB(107 - i * 2 downto 0).asUInt
-    val c2 = (mantB(107 - i * 2 - 1 downto 0) & mantA).resize(108 bits).asUInt
-    csa1(i) := s1 + c1
-    csa2(i) := s2 + c2
+    mantA := Cat(U"1", io.a.mant).asUInt
+    mantB := Cat(U"1", io.b.mant).asUInt
+    expA := io.a.exp.asSInt
+    expB := io.b.exp.asSInt
+    signA := io.a.sign
+    signB := io.b.sign
+    isSingleReg := io.isSingle
+    roundingModeReg := io.roundingMode
   }
-  val sum1 = csa1.reduceBalancedTree(_ + _)
-  val sum2 = csa2.reduceBalancedTree(_ + _)
-  val rawProd = sum1 + sum2 // Raw product (108 bits)
 
-  // Normalize and extract mantissa
-  val normShift = rawProd(107 downto 106) === U"01" // Check if normalized (1.xxxx or 0.1xxx)
-  val mantBits = Mux(normShift, rawProd(105 downto 0), rawProd(106 downto 0)).resize(54 bits)
-  val expAdjust = Mux(normShift, S(-1, 11 bits), S(0, 11 bits))
+  // Pipeline Stage 2: Partial Product Generation and Summation
+  val stage2 = new Area {
+    val prodReg = Reg(UInt(108 bits)) init(0)
+    val exp = Reg(SInt(12 bits)) init(0)
+    val sign = Reg(Bool()) init(False)
+    val isSingle = Reg(Bool()) init(False)
+    val roundingMode = Reg(RoundingMode()) init(RoundingMode.RNE)
 
-  // Rounding per T9000 (ISM 11.12.1)
-  val guard = Mux(io.isSingle, mantBits(29), mantBits(0)) // Guard bit
-  val sticky = Mux(io.isSingle, mantBits(28 downto 0).orR, False) // Sticky bit for double
-  val roundUp = io.roundingMode.mux(
-    RoundingMode.RNE -> (guard && (sticky || mantBits(30))),
-    RoundingMode.RTZ -> False,
-    RoundingMode.RUP -> (guard || sticky) && !io.a.sign,
-    RoundingMode.RDN -> (guard || sticky) && io.a.sign
-  )
-  val mantNorm = mantBits.asUInt.resize(53 bits) // Include implicit bit
-  val roundedMant = mantNorm + roundUp.asUInt
-  val mantOverflow = roundedMant(53) // Check for mantissa overflow (shifts exponent)
+    // Generate and sum partial products using Booth encoding
+    val sum = (0 until 27).map(i => {
+      val prevBit = if (i == 0) U(0, 1 bit) else stage1.mantB(2 * i - 1)
+      val digitBits = if (i < 26) stage1.mantB(2 * i + 1 downto 2 * i) else U"0" ## stage1.mantB(52)
+      val digit = (digitBits ## prevBit).asUInt
+      digit.mux(
+        U(0) -> U(0, 108 bits),
+        U(1) -> stage1.mantA.resize(108 bits),
+        U(2) -> (stage1.mantA << 1).resize(108 bits),
+        U(3) -> ((stage1.mantA << 1) + stage1.mantA).resize(108 bits),
+        U(4) -> (stage1.mantA << 2).resize(108 bits),
+        default -> U(0, 108 bits)
+      ) << (2 * i)
+    }).reduceBalancedTree(_ + _)
+    prodReg := sum.resize(108 bits)  // Take lower 108 bits for the product
 
-  // Exponent calculation
-  val rawExp = io.a.exp.asSInt + io.b.exp.asSInt - S(1023, 11 bits) + expAdjust
-  val finalExp = rawExp + mantOverflow.asSInt
+    exp := stage1.expA + stage1.expB - S(1023, 12 bits)
+    sign := stage1.signA ^ stage1.signB
+    isSingle := stage1.isSingleReg
+    roundingMode := stage1.roundingModeReg
+  }
 
-  // Exception flags (ISM 11.13)
-  val isNan = io.a.isNaN || io.b.isNaN || (io.a.isInf && io.b.isZero) || (io.a.isZero && io.b.isInf)
-  val isInf = (io.a.isInf && !io.b.isZero) || (io.b.isInf && !io.a.isZero)
-  val isZero = io.a.isZero || io.b.isZero
-  val overflow = finalExp > S(2046, 11 bits) && !isNan && !isInf
-  val underflow = finalExp < S(0, 11 bits) && !isNan && !isZero
-  val inexact = guard || sticky
+  // Pipeline Stage 3: Normalization and Rounding
+  val stage3 = new Area {
+    val prod = stage2.prodReg
+    val normShift = prod(107 downto 106) === U"01"
+    val mantBits = Mux(normShift, prod(105 downto 0), prod(106 downto 0)).resize(54 bits)
+    val expAdjust = Mux(normShift, S(-1, 12 bits), S(0, 12 bits))
 
-  // Result assembly
-  io.result.sign := io.a.sign ^ io.b.sign
-  io.result.exp := Mux(overflow, U(2047, 11 bits), Mux(underflow || isZero, U(0, 11 bits), finalExp.asUInt.resize(11 bits)))
-  io.result.mant := Mux(isNan || isInf, B(0, 52 bits), // NaN/Inf have zero mantissa per T9000
-                        Mux(io.isSingle, roundedMant(51 downto 29).resize(52 bits), roundedMant(51 downto 0)))
+    val guard = Mux(stage2.isSingle, mantBits(29), mantBits(0))
+    val sticky = Mux(stage2.isSingle, mantBits(28 downto 0).orR, False)
+    val roundUp = stage2.roundingMode.mux(
+      RoundingMode.RNE -> (guard && (sticky || mantBits(30))),
+      RoundingMode.RTZ -> False,
+      RoundingMode.RUP -> ((guard || sticky) && !stage2.sign),
+      RoundingMode.RDN -> ((guard || sticky) && stage2.sign)
+    )
+    val mantNorm = mantBits.resize(53 bits)
+    val roundedMantFull = (mantNorm.resize(54 bits) + roundUp.asUInt)
+    val mantOverflow = roundedMantFull(53)
+    val roundedMant = roundedMantFull(52 downto 0)
 
-  // Flags per T9000 spec
-  io.flags.NV := isNan
-  io.flags.NX := inexact && !isNan && !isInf
-  io.flags.OF := overflow
-  io.flags.UF := underflow
-  io.flags.DZ := False // Multiplication doesn’t set DZ
+    val finalExp = stage2.exp + expAdjust + mantOverflow.asSInt
+
+    io.result.sign := stage2.sign
+    io.result.exp := finalExp.asUInt.resize(11 bits)
+    io.result.mant := Mux(stage2.isSingle, roundedMant(51 downto 29), roundedMant(51 downto 0)).asBits
+    io.flags.NV := False
+    io.flags.NX := False
+    io.flags.OF := False
+    io.flags.UF := False
+    io.flags.DZ := False
+  }
 }

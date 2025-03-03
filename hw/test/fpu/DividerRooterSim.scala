@@ -20,7 +20,7 @@ object DividerRooterSim {
       dut.io.isSingle #= false
       dut.io.roundingMode #= RoundingMode.RNE
       dut.clockDomain.waitSampling(15)
-      val result1 = dut.io.result.payload.toBigInt
+      val result1 = dut.io.result.asBits.toBigInt  // Changed to asBits
       assert(result1 == BigInt("4000000000000000", 16), s"Div double failed: $result1")
 
       // Test 2: Sqrt 16.0 (single)
@@ -30,7 +30,7 @@ object DividerRooterSim {
       dut.io.isDiv #= false
       dut.io.isSingle #= true
       dut.clockDomain.waitSampling(7)
-      val result2 = dut.io.result.payload.toBigInt
+      val result2 = dut.io.result.asBits.toBigInt  // Changed to asBits
       assert(result2 == BigInt("4080000000000000", 16), s"Sqrt single failed: $result2")
 
       println("DividerRooter tests passed!")
