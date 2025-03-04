@@ -20,9 +20,9 @@ case class FPUConfig(precision: Int = 64) {
 
 // IEEE-754 Float Data
 case class FloatData(config: FPUConfig) extends Bundle {
-  val sign = Bool()  // IEEE-754 Sign Bit: 0=positive, 1=negative
-  val exponent = UInt(config.exponentWidth bits)  // IEEE-754 Exponent: biased by config.bias
-  val mantissa = UInt(config.mantissaWidth bits)  // IEEE-754 Mantissa: implicit leading 1 for normalized
+  val sign = Bool()
+  val exponent = UInt(config.exponentWidth bits)
+  val mantissa = UInt(config.mantissaWidth bits)
 
   def asBits: Bits = Cat(sign, exponent, mantissa)
   def fromBits(bits: Bits): FloatData = {
@@ -36,7 +36,7 @@ case class FloatData(config: FPUConfig) extends Bundle {
   def isDenormal: Bool = exponent === 0 && mantissa =/= 0
   def isInfinity: Bool = exponent === U(config.maxExponent) && mantissa === 0
   def isNaN: Bool = exponent === U(config.maxExponent) && mantissa =/= 0
-  def isSignalingNaN: Bool = isNaN && !mantissa(config.mantissaWidth - 1)  // MSB = 0 for signaling NaN
+  def isSignalingNaN: Bool = isNaN && !mantissa(config.mantissaWidth - 1)
   def isFinite: Bool = !isInfinity && !isNaN
   def normalizedMantissa: UInt = Cat(True, mantissa)
 }
@@ -80,14 +80,35 @@ case class MicrocodeInstruction() extends Bundle {
   val nextPc = UInt(6 bits)
 }
 
-// Payload
-case class FpuPayload(config: FPUConfig) extends Bundle {
+// Base Intermediate State (extensible by plugins)
+class FpuIntermediateState(config: FPUConfig) extends Bundle {
+  val tempA = new FloatData(config)  // General-purpose temp for DIV/SQRT/REM
+  val tempB = new FloatData(config)  // General-purpose temp (e.g., counter or quotient)
+  val partialProducts = Vec(UInt(config.mantissaWidth * 2 + 4 bits), config.mantissaWidth / 2 + 2)  // For MUL
+  val partialSum = Vec(UInt(config.mantissaWidth * 2 + 4 bits), 2)  // For MUL
+
+  def init(): this.type = {
+    tempA.assignFromBits(B"0".resize(config.totalWidth))
+    tempB.assignFromBits(B"0".resize(config.totalWidth))
+    partialProducts.foreach(_ := 0)
+    partialSum.foreach(_ := 0)
+    this
+  }
+}
+
+// Trait for plugins to extend intermediate state
+trait FpuIntermediateStateExtension[T <: FpuIntermediateState] {
+  def extend(config: FPUConfig): T
+}
+
+// Updated FpuPayload with parameterized intermediate state
+case class FpuPayload[T <: FpuIntermediateState](config: FPUConfig, intermediateFactory: FPUConfig => T) extends Bundle {
   val FA, FB, FC = new FloatData(config)
   val opcode = FpuOperation()
   val microPc = UInt(6 bits)
   val result = new FloatData(config)
   val status = new FPUStatus()
-  val tempA, tempB = new FloatData(config)  // Used for state passing (e.g., remainder, quotient)
+  val intermediate = intermediateFactory(config)
 }
 
 // Stack Plugin
@@ -95,7 +116,6 @@ class FPUStackPlugin(config: FPUConfig) extends FiberPlugin {
   val logic = during build { new Area {
     val stack = Vec(Reg(new FloatData(config)), 3)  // FA, FB, FC
     val types = Vec(Reg(UInt(2 bits)), 3)  // 0=Single, 1=Double
-    val tempA, tempB = Reg(new FloatData(config))
 
     def push(data: FloatData, precision: UInt): Unit = {
       stack(1) := stack(0); stack(2) := stack(1); stack(0) := data
@@ -132,7 +152,7 @@ class VCUPlugin(config: FPUConfig) extends FiberPlugin {
       (floatA.isNaN) -> floatA,
       (floatB.isNaN) -> floatB,
       (floatA.isInfinity && floatB.isInfinity && io.opcode === FpuOperation.DIV) -> floatA.fromBits(B"0x7FFC000000000000"),
-      (floatA.isInfinity && floatB.isInfinity && io.opcode === FpuOperation.SUB && floatA.sign =/= floatB.sign) -> floatA.fromBits(B"0x7FF8000000000000")  // AddOpInfsNaN
+      (floatA.isInfinity && floatB.isInfinity && io.opcode === FpuOperation.SUB && floatA.sign =/= floatB.sign) -> floatA.fromBits(B"0x7FF8000000000000")
     ))
     status.invalid := floatA.isNaN || floatB.isNaN || (floatA.isInfinity && floatB.isInfinity && io.opcode === FpuOperation.SUB && floatA.sign =/= floatB.sign)
     status.divideByZero := floatA.isFinite && floatB.isZero && io.opcode === FpuOperation.DIV
@@ -140,7 +160,7 @@ class VCUPlugin(config: FPUConfig) extends FiberPlugin {
   }}
 }
 
-// Adder/Subtractor Plugin
+// Adder/Subtractor Plugin (Single-Stage)
 class AdderSubtractorPlugin(config: FPUConfig) extends FiberPlugin {
   val logic = during build { new Area {
     val io = new Bundle {
@@ -151,26 +171,22 @@ class AdderSubtractorPlugin(config: FPUConfig) extends FiberPlugin {
       val outStatus = out(FPUStatus())
     }
 
-    // Twin alignment shifters for mantissas
     val expDiff = (io.opA.exponent - io.opB.exponent).asSInt
     val largerExp = Mux(expDiff >= 0, io.opA.exponent, io.opB.exponent)
-    val mantAExt = Cat(True, io.opA.mantissa, U"3'b000").asUInt  // Extended for guard, round, sticky
+    val mantAExt = Cat(True, io.opA.mantissa, U"3'b000").asUInt
     val mantBExt = Cat(True, io.opB.mantissa, U"3'b000").asUInt
-    val alignedMantB1 = mantBExt >> expDiff.abs  // First shifter
-    val alignedMantB2 = mantBExt >> (expDiff.abs + 1)  // Second shifter for NDP
+    val alignedMantB1 = mantBExt >> expDiff.abs
+    val alignedMantB2 = mantBExt >> (expDiff.abs + 1)
 
-    // Addition/Subtraction with NDP (near-difference path)
     val sumNoOverflow = (mantAExt.asSInt + (if (io.isSubtract) -alignedMantB1.asSInt else alignedMantB1.asSInt)).asUInt
     val sumWithOverflow = (mantAExt.asSInt + (if (io.isSubtract) -alignedMantB2.asSInt else alignedMantB2.asSInt)).asUInt >> 1
     val useOverflow = sumNoOverflow >= (2 << config.mantissaWidth)
     val rawMantissa = Mux(useOverflow, sumWithOverflow, sumNoOverflow)
 
-    // Result computation
     io.result.sign := io.opA.sign ^ io.opB.sign ^ io.isSubtract
     io.result.exponent := largerExp + (if (useOverflow) 1 else 0)
     io.result.mantissa := rawMantissa(config.mantissaWidth + 2 downto 3)
 
-    // Status update
     io.outStatus := io.status
     io.outStatus.overflow := io.result.exponent >= config.maxExponent
     io.outStatus.underflow := io.result.exponent <= 0
@@ -178,89 +194,104 @@ class AdderSubtractorPlugin(config: FPUConfig) extends FiberPlugin {
   }}
 }
 
-// Multiplier Plugin with Booth Recoding and Twin-Array CSA
-class MultiplierPlugin(config: FPUConfig) extends FiberPlugin {
+// Multiplier Plugin (Retimed)
+class MultiplierPlugin[T <: FpuIntermediateState](config: FPUConfig) extends FiberPlugin {
   val logic = during build { new Area {
     val io = new Bundle {
       val opA, opB = in(new FloatData(config))
       val status = in(FPUStatus())
       val result = out(new FloatData(config))
       val outStatus = out(FPUStatus())
+      val partialProducts = out(Vec(UInt(config.mantissaWidth * 2 + 4 bits), config.mantissaWidth / 2 + 2))
+      val sign = out Bool()
+      val exp = out(UInt(config.exponentWidth bits))
+      val partialSum = out(Vec(UInt(config.mantissaWidth * 2 + 4 bits), 2))
+      val partialProductsIn = in(Vec(UInt(config.mantissaWidth * 2 + 4 bits), config.mantissaWidth / 2 + 2))
+      val signIn = in Bool()
+      val expIn = in(UInt(config.exponentWidth bits))
+      val partialSumIn = in(Vec(UInt(config.mantissaWidth * 2 + 4 bits), 2))
+      val stage = in UInt(2 bits)
     }
 
-    // Prepare mantissas with implicit 1
-    val mantAExt = Cat(True, io.opA.mantissa).asUInt
-    val mantBExt = Cat(True, io.opB.mantissa).asUInt
-
-    // Radix-2 Booth recoding
-    val boothDigits = (0 until config.mantissaWidth / 2 + 2).map { i =>
-      val bits = Cat(
-        if (2 * i + 1 < config.mantissaWidth + 1) mantBExt(2 * i + 1) else False,
-        if (2 * i < config.mantissaWidth + 1) mantBExt(2 * i) else False,
-        if (i == 0) False else mantBExt(2 * i - 1)
-      )
-      MuxCase(S"2'b00", Seq(
-        (bits === U"3'b000") -> S"2'b00",
-        (bits === U"3'b001") -> S"2'b01",
-        (bits === U"3'b010") -> S"2'b01",
-        (bits === U"3'b011") -> S"2'b10",
-        (bits === U"3'b100") -> S"-2'b10",
-        (bits === U"3'b101") -> S"-2'b01",
-        (bits === U"3'b110") -> S"-2'b01",
-        (bits === U"3'b111") -> S"2'b00"
-      )).asSInt
-    }
-
-    // Generate partial products
-    val partialProducts = boothDigits.zipWithIndex.map { case (digit, i) =>
-      val pp = MuxCase(U"0", Seq(
-        (digit === 0) -> U"0",
-        (digit === 1) -> mantAExt,
-        (digit === 2) -> (mantAExt << 1),
-        (digit === -1) -> (-mantAExt),
-        (digit === -2) -> (-(mantAExt << 1))
-      )).asUInt << (2 * i)
-      pp.resize(config.mantissaWidth * 2 + 4)
-    }
-
-    // Twin-array CSA tree reduction
     def csa(a: UInt, b: UInt, c: UInt): (UInt, UInt) = {
       val sum = a ^ b ^ c
       val carry = (a & b) | (b & c) | (a & c)
       (sum, carry << 1)
     }
 
-    def csaTree(products: Seq[UInt]): UInt = {
-      if (products.length <= 2) products.reduce(_ + _)
-      else {
-        val grouped = products.grouped(3).toSeq.map {
-          case Seq(a, b, c) => csa(a, b, c)
-          case Seq(a, b) => (a + b, U"0")
-          case Seq(a) => (a, U"0")
-        }
-        val sums = grouped.map(_._1)
-        val carries = grouped.map(_._2)
-        csaTree(sums) + csaTree(carries)
+    when(io.stage === 0) {
+      val mantAExt = Cat(True, io.opA.mantissa).asUInt
+      val mantBExt = Cat(True, io.opB.mantissa).asUInt
+      val boothDigits = (0 until config.mantissaWidth / 2 + 2).map { i =>
+        val bits = Cat(
+          if (2 * i + 1 < config.mantissaWidth + 1) mantBExt(2 * i + 1) else False,
+          if (2 * i < config.mantissaWidth + 1) mantBExt(2 * i) else False,
+          if (i == 0) False else mantBExt(2 * i - 1)
+        )
+        MuxCase(S"2'b00", Seq(
+          (bits === U"3'b000") -> S"2'b00",
+          (bits === U"3'b001") -> S"2'b01",
+          (bits === U"3'b010") -> S"2'b01",
+          (bits === U"3'b011") -> S"2'b10",
+          (bits === U"3'b100") -> S"-2'b10",
+          (bits === U"3'b101") -> S"-2'b01",
+          (bits === U"3'b110") -> S"-2'b01",
+          (bits === U"3'b111") -> S"2'b00"
+        )).asSInt
       }
+
+      io.partialProducts.zipWithIndex.foreach { case (pp, i) =>
+        val digit = boothDigits(i)
+        pp := MuxCase(U"0", Seq(
+          (digit === 0) -> U"0",
+          (digit === 1) -> mantAExt,
+          (digit === 2) -> (mantAExt << 1),
+          (digit === -1) -> (-mantAExt),
+          (digit === -2) -> (-(mantAExt << 1))
+        )).asUInt << (2 * i)
+        pp.resize(config.mantissaWidth * 2 + 4)
+      }
+      io.sign := io.opA.sign ^ io.opB.sign
+      io.exp := io.opA.exponent + io.opB.exponent - config.bias
+      io.partialSum(0) := 0
+      io.partialSum(1) := 0
+      io.result := io.opA
+    } elsewhen(io.stage === 1) {
+      val grouped = io.partialProductsIn.grouped(3).toSeq.map {
+        case Seq(a, b, c) => csa(a, b, c)
+        case Seq(a, b) => (a + b, U"0")
+        case Seq(a) => (a, U"0")
+      }
+      io.partialSum(0) := grouped.map(_._1).reduce(_ +_)
+      io.partialSum(1) := grouped.map(_._2).reduce(_ +_)
+      io.sign := io.signIn
+      io.exp := io.expIn
+      io.partialProducts := io.partialProductsIn
+      io.result := io.opA
+    } otherwise {
+      val product = io.partialSumIn(0) + io.partialSumIn(1)
+      val normalizedProduct = product(config.mantissaWidth * 2 + 2 downto config.mantissaWidth)
+      val expResult = io.expIn + (if (product(config.mantissaWidth * 2 + 3)) 1 else 0)
+
+      io.result.sign := io.signIn
+      io.result.exponent := expResult
+      io.result.mantissa := normalizedProduct(config.mantissaWidth - 1 downto 0)
+      io.outStatus := io.status
+      io.outStatus.overflow := expResult >= config.maxExponent
+      io.outStatus.underflow := expResult <= 0
+      io.outStatus.inexact := product(config.mantissaWidth - 1 downto 0) =/= 0
+      io.partialProducts := io.partialProductsIn
+      io.partialSum := io.partialSumIn
+      io.sign := io.signIn
+      io.exp := io.expIn
     }
 
-    val product = csaTree(partialProducts)
-    val normalizedProduct = product(config.mantissaWidth * 2 + 2 downto config.mantissaWidth)
-    val expResult = io.opA.exponent + io.opB.exponent - config.bias + (if (product(config.mantissaWidth * 2 + 3)) 1 else 0)
-
-    io.result.sign := io.opA.sign ^ io.opB.sign
-    io.result.exponent := expResult
-    io.result.mantissa := normalizedProduct(config.mantissaWidth - 1 downto 0)
-
     io.outStatus := io.status
-    io.outStatus.overflow := expResult >= config.maxExponent
-    io.outStatus.underflow := expResult <= 0
-    io.outStatus.inexact := product(config.mantissaWidth - 1 downto 0) =/= 0
   }}
 }
 
-// Divider/Square Root Plugin with Retimed Radix-2 SRT
-class DividerSqrtPlugin(config: FPUConfig) extends FiberPlugin {
+// Divider/Square Root Plugin (Retimed)
+class DividerSqrtPlugin[T <: FpuIntermediateState](config: FPUConfig) extends FiberPlugin {
   val logic = during build { new Area {
     val io = new Bundle {
       val dividend, divisor = in(new FloatData(config))
@@ -268,9 +299,9 @@ class DividerSqrtPlugin(config: FPUConfig) extends FiberPlugin {
       val status = in(FPUStatus())
       val result = out(new FloatData(config))
       val outStatus = out(FPUStatus())
-      val partialRemainderOut = out(SInt(config.mantissaWidth + 4 bits))
-      val quotientOut = out(UInt(config.mantissaWidth + 4 bits))
-      val counterOut = out(UInt(log2Up(config.mantissaWidth + 1) bits))
+      val partialRemainder = out(SInt(config.mantissaWidth + 4 bits))
+      val quotient = out(UInt(config.mantissaWidth + 4 bits))
+      val counter = out(UInt(log2Up(config.mantissaWidth + 1) bits))
       val partialRemainderIn = in(SInt(config.mantissaWidth + 4 bits))
       val quotientIn = in(UInt(config.mantissaWidth + 4 bits))
       val counterIn = in(UInt(log2Up(config.mantissaWidth + 1) bits))
@@ -285,7 +316,6 @@ class DividerSqrtPlugin(config: FPUConfig) extends FiberPlugin {
     val divisorMant = Cat(True, io.divisor.mantissa).asUInt
 
     when(io.finalize) {
-      // Final iteration in ROUND stage
       partialRemainder := io.partialRemainderIn
       quotient := io.quotientIn
       counter := io.counterIn
@@ -295,7 +325,6 @@ class DividerSqrtPlugin(config: FPUConfig) extends FiberPlugin {
         io.dividend.exponent - io.divisor.exponent + config.bias)
       io.result.mantissa := quotient(config.mantissaWidth + 2 downto 3)
     } otherwise {
-      // Initial and intermediate iterations in MICROCODE and NORMALIZE
       when(counter === 0) {
         partialRemainder := (if (io.isSquareRoot) S(dividendMant) else S(dividendMant) << (config.mantissaWidth + 1)).resize(extWidth)
         quotient := 0
@@ -309,12 +338,12 @@ class DividerSqrtPlugin(config: FPUConfig) extends FiberPlugin {
         quotient := (quotient << 2) | qDigit.abs
       }
       counter := counter + 1
-      io.result := io.dividend  // Placeholder during iterations
+      io.result := io.dividend
     }
 
-    io.partialRemainderOut := partialRemainder
-    io.quotientOut := quotient
-    io.counterOut := counter
+    io.partialRemainder := partialRemainder
+    io.quotient := quotient
+    io.counter := counter
     io.outStatus := io.status
     io.outStatus.divideByZero := io.divisor.isZero && !io.isSquareRoot
     io.outStatus.inexact := quotient(2 downto 0) =/= 0
@@ -329,7 +358,7 @@ class MicrocodeROMPlugin(config: FPUConfig) extends FiberPlugin {
       val address = in UInt(6 bits)
       val instruction = out(MicrocodeInstruction())
     }
-    val rom = Mem(MicrocodeInstruction(), 128)  // Increased size for all instructions
+    val rom = Mem(MicrocodeInstruction(), 128)
     rom.initialContent = MicrocodeGenerator.generateMicrocode(config, io.operation).map(_.asBits.as(MicrocodeInstruction()))
     io.instruction := rom.readSync(io.address)
   }}
@@ -341,7 +370,6 @@ class MicrocodeROMPlugin(config: FPUConfig) extends FiberPlugin {
 
       val base = Seq(instr(MicrocodeOp.LOAD, 1, 0, 0, 1))
       operation match {
-        // Table 11.24: Load/Store Operations
         case FpuOperation.LDLNSN => base ++ Seq(instr(MicrocodeOp.LOAD, 0, 0, 1, 0))
         case FpuOperation.LDNLDB => base ++ Seq(instr(MicrocodeOp.LOAD, 0, 0, 1, 0))
         case FpuOperation.LDNLSNI => base ++ Seq(instr(MicrocodeOp.LOAD, 0, 0, 1, 0))
@@ -363,7 +391,7 @@ class MicrocodeROMPlugin(config: FPUConfig) extends FiberPlugin {
         case FpuOperation.LDNLMULSN => base ++ Seq(
           instr(MicrocodeOp.LOAD, 0, 0, 4, 2),
           instr(MicrocodeOp.MUL, 1, 4, 1, 3),
-          instr(MicrocodeOp.NORM, 1, 0, 1, 4),
+          instr(MicrocodeOp.NORM, 1, 0, 1, if (config.isSinglePrecision) 0 else 4),
           instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
         )
         case FpuOperation.LDNLMULDB => base ++ Seq(
@@ -379,33 +407,25 @@ class MicrocodeROMPlugin(config: FPUConfig) extends FiberPlugin {
           instr(MicrocodeOp.STORE, 4, 0, 0, 0)
         )
         case FpuOperation.STALL => base ++ Seq(
-          instr(MicrocodeOp.STORE, 0, 0, 0, 1),  // Status
-          instr(MicrocodeOp.STORE, 1, 0, 0, 2),  // FA low
-          instr(MicrocodeOp.STORE, 1, 0, 0, 3),  // FA high (if double)
-          instr(MicrocodeOp.STORE, 2, 0, 0, 4),  // FB low
-          instr(MicrocodeOp.STORE, 2, 0, 0, 5),  // FB high (if double)
-          instr(MicrocodeOp.STORE, 3, 0, 0, 6),  // FC low
-          instr(MicrocodeOp.STORE, 3, 0, 0, 0)   // FC high (if double)
+          instr(MicrocodeOp.STORE, 0, 0, 0, 1),
+          instr(MicrocodeOp.STORE, 1, 0, 0, 2),
+          instr(MicrocodeOp.STORE, 1, 0, 0, 3),
+          instr(MicrocodeOp.STORE, 2, 0, 0, 4),
+          instr(MicrocodeOp.STORE, 2, 0, 0, 5),
+          instr(MicrocodeOp.STORE, 3, 0, 0, 6),
+          instr(MicrocodeOp.STORE, 3, 0, 0, 0)
         )
-
-        // Table 11.25: General Operations
         case FpuOperation.ENTRY => base ++ Seq(instr(MicrocodeOp.FINALIZE, 0, 0, 0, 0))
         case FpuOperation.REV => base ++ Seq(instr(MicrocodeOp.REV, 1, 2, 0, 0))
         case FpuOperation.DUP => base ++ Seq(instr(MicrocodeOp.DUP, 1, 0, 0, 0))
-
-        // Table 11.26: Rounding Operations
         case FpuOperation.RN => base ++ Seq(instr(MicrocodeOp.SETROUND, 1, 0, 0, 0))
         case FpuOperation.RZ => base ++ Seq(instr(MicrocodeOp.SETROUND, 0, 0, 0, 0))
         case FpuOperation.RP => base ++ Seq(instr(MicrocodeOp.SETROUND, 2, 0, 0, 0))
         case FpuOperation.RM => base ++ Seq(instr(MicrocodeOp.SETROUND, 3, 0, 0, 0))
-
-        // Table 11.27: Error Operations
         case FpuOperation.CHKERR => base ++ Seq(instr(MicrocodeOp.CHECKERR, 0, 0, 0, 0))
         case FpuOperation.TESTERR => base ++ Seq(instr(MicrocodeOp.TESTERR, 0, 0, 0, 0))
         case FpuOperation.SETERR => base ++ Seq(instr(MicrocodeOp.SETERR, 0, 0, 0, 0))
         case FpuOperation.CLRERR => base ++ Seq(instr(MicrocodeOp.CLRERR, 0, 0, 0, 0))
-
-        // Table 11.28: Comparison Operations
         case FpuOperation.GT => base ++ Seq(instr(MicrocodeOp.CMPGT, 1, 2, 4, 0))
         case FpuOperation.EQ => base ++ Seq(instr(MicrocodeOp.CMPEQ, 1, 2, 4, 0))
         case FpuOperation.ORDERED => base ++ Seq(instr(MicrocodeOp.CMPORDER, 1, 2, 4, 0))
@@ -413,8 +433,6 @@ class MicrocodeROMPlugin(config: FPUConfig) extends FiberPlugin {
         case FpuOperation.NOTFINITE => base ++ Seq(instr(MicrocodeOp.CMPNOTFINITE, 1, 0, 4, 0))
         case FpuOperation.CHKI32 => base ++ Seq(instr(MicrocodeOp.CHKI, 1, 0, 4, 0))
         case FpuOperation.CHKI64 => base ++ Seq(instr(MicrocodeOp.CHKI, 1, 0, 4, 0))
-
-        // Table 11.29: Conversion Operations
         case FpuOperation.R32TOR64 => base ++ Seq(instr(MicrocodeOp.R32TOR64, 1, 0, 1, 0))
         case FpuOperation.R64TOR32 => base ++ Seq(
           instr(MicrocodeOp.R64TOR32, 1, 0, 1, 2),
@@ -426,8 +444,6 @@ class MicrocodeROMPlugin(config: FPUConfig) extends FiberPlugin {
         case FpuOperation.B32TOR64 => base ++ Seq(instr(MicrocodeOp.CONVERT, 1, 0, 1, 0))
         case FpuOperation.NOROUND => base ++ Seq(instr(MicrocodeOp.NOROUND, 1, 0, 1, 0))
         case FpuOperation.INT => base ++ Seq(instr(MicrocodeOp.INTOP, 1, 0, 1, 0))
-
-        // Table 11.30: Arithmetic Operations
         case FpuOperation.ADD => base ++ Seq(
           instr(MicrocodeOp.ADD, 1, 2, 1, 2),
           instr(MicrocodeOp.NORM, 1, 0, 1, 3),
@@ -440,50 +456,45 @@ class MicrocodeROMPlugin(config: FPUConfig) extends FiberPlugin {
         )
         case FpuOperation.MUL => base ++ Seq(
           instr(MicrocodeOp.MUL, 1, 2, 1, 2),
-          instr(MicrocodeOp.NORM, 1, 0, 1, 3),
+          instr(MicrocodeOp.NORM, 1, 0, 1, if (config.isSinglePrecision) 0 else 3),
           instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
         )
         case FpuOperation.DIV => base ++ Seq(
-          instr(MicrocodeOp.DIV, 1, 2, 1, 2),  // 13 iterations in MICROCODE
-          instr(MicrocodeOp.NORM, 1, 0, 1, 3), // 14th iteration in NORMALIZE
-          instr(MicrocodeOp.ROUND, 1, 0, 1, 0) // 15th iteration and rounding in ROUND
+          instr(MicrocodeOp.DIV, 1, 2, 1, 2),
+          instr(MicrocodeOp.NORM, 1, 0, 1, 3),
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
         )
         case FpuOperation.ABS => base ++ Seq(instr(MicrocodeOp.ABS, 1, 0, 1, 0))
         case FpuOperation.EXPINC32 => base ++ Seq(instr(MicrocodeOp.EXPINC32, 1, 0, 1, 0))
         case FpuOperation.EXPDEC32 => base ++ Seq(instr(MicrocodeOp.EXPDEC32, 1, 0, 1, 0))
         case FpuOperation.MULBY2 => base ++ Seq(instr(MicrocodeOp.MULBY2, 1, 0, 1, 0))
         case FpuOperation.DIVBY2 => base ++ Seq(instr(MicrocodeOp.DIVBY2, 1, 0, 1, 0))
-
-        // Table 11.31: Compatibility Operations (Simplified)
         case FpuOperation.SQRTFIRST => base ++ Seq(instr(MicrocodeOp.SQRT, 1, 0, 1, 0))
         case FpuOperation.SQRTSTEP => base ++ Seq(instr(MicrocodeOp.SQRT, 1, 0, 1, 0))
         case FpuOperation.SQRTLAST => base ++ Seq(instr(MicrocodeOp.SQRT, 1, 0, 1, 0))
         case FpuOperation.REMFIRST => base ++ Seq(instr(MicrocodeOp.REM, 1, 2, 1, 0))
         case FpuOperation.REMSTEP => base ++ Seq(instr(MicrocodeOp.REM, 1, 2, 1, 0))
-
-        // Table 11.32: Additional Operations
         case FpuOperation.REM => base ++ Seq(
           instr(MicrocodeOp.REM, 1, 2, 1, 2),
           instr(MicrocodeOp.NORM, 1, 0, 1, 3),
           instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
         )
         case FpuOperation.SQRT => base ++ Seq(
-          instr(MicrocodeOp.SQRT, 1, 0, 1, 2), // 13 iterations in MICROCODE
-          instr(MicrocodeOp.NORM, 1, 0, 1, 3), // 14th iteration in NORMALIZE
-          instr(MicrocodeOp.ROUND, 1, 0, 1, 0) // 15th iteration and rounding in ROUND
+          instr(MicrocodeOp.SQRT, 1, 0, 1, 2),
+          instr(MicrocodeOp.NORM, 1, 0, 1, 3),
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
         )
         case FpuOperation.RANGE => base ++ Seq(instr(MicrocodeOp.FINALIZE, 0, 0, 0, 0))
         case FpuOperation.GE => base ++ Seq(instr(MicrocodeOp.CMPGT, 1, 2, 4, 0))
         case FpuOperation.LG => base ++ Seq(instr(MicrocodeOp.CMPGT, 2, 1, 4, 0))
-
         case _ => base ++ Seq(instr(MicrocodeOp.FINALIZE, 0, 0, 0, 0))
       }
     }
   }
 }
 
-// Top-Level FPU with Retimed Pipeline
-class T9000Fpu(config: FPUConfig) extends PluginHost {
+// Top-Level FPU (Part 1: Setup and Initial Stages)
+class T9000Fpu[T <: FpuIntermediateState](config: FPUConfig, intermediateFactory: FPUConfig => T = (c: FPUConfig) => new FpuIntermediateState(c)) extends PluginHost {
   val io = new Bundle {
     val inputA, inputB, inputC = in Bits(config.totalWidth bits)
     val operation = in(FpuOperation())
@@ -497,8 +508,8 @@ class T9000Fpu(config: FPUConfig) extends PluginHost {
   val stackPlugin = addService(new FPUStackPlugin(config))
   val vcuPlugin = addService(new VCUPlugin(config))
   val adderSubPlugin = addService(new AdderSubtractorPlugin(config))
-  val multiplierPlugin = addService(new MultiplierPlugin(config))
-  val dividerSqrtPlugin = addService(new DividerSqrtPlugin(config))
+  val multiplierPlugin = addService(new MultiplierPlugin[T](config))
+  val dividerSqrtPlugin = addService(new DividerSqrtPlugin[T](config))
   val microRomPlugin = addService(new MicrocodeROMPlugin(config))
 
   val logic = during build { new Area {
@@ -507,13 +518,14 @@ class T9000Fpu(config: FPUConfig) extends PluginHost {
     pipeline.build()
 
     val FETCH = new pipeline.Ctrl(0) {
-      val PAYLOAD = insert(FpuPayload(config))
+      val PAYLOAD = insert(FpuPayload(config, intermediateFactory))
       PAYLOAD.FA := stackPlugin.logic.stack(0).fromBits(io.inputA)
       PAYLOAD.FB := stackPlugin.logic.stack(1).fromBits(io.inputB)
       PAYLOAD.FC := stackPlugin.logic.stack(2).fromBits(io.inputC)
       PAYLOAD.opcode := io.operation
       PAYLOAD.microPc := 0
       PAYLOAD.status := status
+      PAYLOAD.intermediate.init()
     }
 
     val DECODE = new pipeline.Ctrl(1) {
@@ -562,10 +574,10 @@ class T9000Fpu(config: FPUConfig) extends PluginHost {
             stackPlugin.logic.push(FETCH.PAYLOAD.FA, 1)
           }
           when(FETCH.PAYLOAD.opcode === FpuOperation.LDNLADDSN || FETCH.PAYLOAD.opcode === FpuOperation.LDNLMULSN) {
-            FETCH.PAYLOAD.tempA := FloatData(config).fromBits(mem.readSync(io.memAddress).resize(32))
+            FETCH.PAYLOAD.intermediate.tempA := FloatData(config).fromBits(mem.readSync(io.memAddress).resize(32))
           }
           when(FETCH.PAYLOAD.opcode === FpuOperation.LDNLADDDB || FETCH.PAYLOAD.opcode === FpuOperation.LDNLMULDB) {
-            FETCH.PAYLOAD.tempA := FloatData(config).fromBits(Cat(mem.readSync(io.memAddress + 1), mem.readSync(io.memAddress)))
+            FETCH.PAYLOAD.intermediate.tempA := FloatData(config).fromBits(Cat(mem.readSync(io.memAddress + 1), mem.readSync(io.memAddress)))
           }
         }
         is(MicrocodeOp.STORE) {
@@ -590,17 +602,19 @@ class T9000Fpu(config: FPUConfig) extends PluginHost {
             stackPlugin.logic.pop()
           }
           when(FETCH.PAYLOAD.opcode === FpuOperation.STNLI32) {
-            mem.write(io.memAddress, FETCH.PAYLOAD.tempA.asBits(31 downto 0))
+            mem.write(io.memAddress, FETCH.PAYLOAD.intermediate.tempA.asBits(31 downto 0))
             stackPlugin.logic.pop()
           }
         }
         is(MicrocodeOp.ADD) {
-          adderSubPlugin.logic.io.opA := Mux(microInst.srcA === 1, FETCH.PAYLOAD.FA, FETCH.PAYLOAD.tempA)
+          adderSubPlugin.logic.io.opA := Mux(microInst.srcA === 1, FETCH.PAYLOAD.FA, FETCH.PAYLOAD.intermediate.tempA)
           adderSubPlugin.logic.io.opB := FETCH.PAYLOAD.FB
           adderSubPlugin.logic.io.isSubtract := False
           adderSubPlugin.logic.io.status := FETCH.PAYLOAD.status
           FETCH.PAYLOAD.result := adderSubPlugin.logic.io.result
           FETCH.PAYLOAD.status := adderSubPlugin.logic.io.outStatus
+          when(config.isSinglePrecision && FETCH.PAYLOAD.microPc < 1) { haltIt() }  // 2 cycles
+          when(!config.isSinglePrecision && FETCH.PAYLOAD.microPc < 2) { haltIt() }  // 3 cycles
         }
         is(MicrocodeOp.SUB) {
           adderSubPlugin.logic.io.opA := FETCH.PAYLOAD.FB
@@ -610,25 +624,36 @@ class T9000Fpu(config: FPUConfig) extends PluginHost {
           FETCH.PAYLOAD.result := adderSubPlugin.logic.io.result
           FETCH.PAYLOAD.status := adderSubPlugin.logic.io.outStatus
           stackPlugin.logic.pop()
+          when(config.isSinglePrecision && FETCH.PAYLOAD.microPc < 1) { haltIt() }  // 2 cycles
+          when(!config.isSinglePrecision && FETCH.PAYLOAD.microPc < 2) { haltIt() }  // 3 cycles
         }
         is(MicrocodeOp.MUL) {
-          multiplierPlugin.logic.io.opA := Mux(microInst.srcA === 1, FETCH.PAYLOAD.FA, FETCH.PAYLOAD.tempA)
+          multiplierPlugin.logic.io.opA := Mux(microInst.srcA === 1, FETCH.PAYLOAD.FA, FETCH.PAYLOAD.intermediate.tempA)
           multiplierPlugin.logic.io.opB := FETCH.PAYLOAD.FB
           multiplierPlugin.logic.io.status := FETCH.PAYLOAD.status
-          FETCH.PAYLOAD.result := multiplierPlugin.logic.io.result
-          FETCH.PAYLOAD.status := multiplierPlugin.logic.io.outStatus
+          multiplierPlugin.logic.io.stage := 0
+          multiplierPlugin.logic.io.partialProductsIn := Vec.fill(config.mantissaWidth / 2 + 2)(U"0")
+          multiplierPlugin.logic.io.signIn := False
+          multiplierPlugin.logic.io.expIn := 0
+          multiplierPlugin.logic.io.partialSumIn := Vec.fill(2)(U"0")
+          FETCH.PAYLOAD.intermediate.partialProducts := multiplierPlugin.logic.io.partialProducts
+          FETCH.PAYLOAD.result.sign := multiplierPlugin.logic.io.sign
+          FETCH.PAYLOAD.result.exponent := multiplierPlugin.logic.io.exp
+          FETCH.PAYLOAD.intermediate.partialSum := multiplierPlugin.logic.io.partialSum
+          when(config.isSinglePrecision && FETCH.PAYLOAD.microPc < 1) { haltIt() }  // 2 cycles
+          when(!config.isSinglePrecision && FETCH.PAYLOAD.microPc < 2) { haltIt() }  // 3 cycles
         }
         is(MicrocodeOp.DIV, MicrocodeOp.SQRT) {
           FETCH.PAYLOAD.result := dividerSqrtPlugin.logic.io.result
           FETCH.PAYLOAD.status := dividerSqrtPlugin.logic.io.outStatus
-          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(dividerSqrtPlugin.logic.io.partialRemainderOut.asBits.resize(config.totalWidth))
-          FETCH.PAYLOAD.tempB := FETCH.PAYLOAD.FA.fromBits(dividerSqrtPlugin.logic.io.quotientOut.asBits.resize(config.totalWidth))
+          FETCH.PAYLOAD.intermediate.tempA := FETCH.PAYLOAD.FA.fromBits(dividerSqrtPlugin.logic.io.partialRemainder.asBits.resize(config.totalWidth))
+          FETCH.PAYLOAD.intermediate.tempB := FETCH.PAYLOAD.FA.fromBits(dividerSqrtPlugin.logic.io.quotient.asBits.resize(config.totalWidth))
         }
         is(MicrocodeOp.CONVERT) {
           when(FETCH.PAYLOAD.opcode === FpuOperation.STNLI32 || FETCH.PAYLOAD.opcode === FpuOperation.RTOI32) {
             val mantissaShifted = S(FETCH.PAYLOAD.FA.normalizedMantissa) << (FETCH.PAYLOAD.FA.exponent.toSInt - config.bias)
             val int64 = Mux(FETCH.PAYLOAD.FA.sign, -mantissaShifted, mantissaShifted)
-            FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(int64.asBits.resize(config.totalWidth))
+            FETCH.PAYLOAD.intermediate.tempA := FETCH.PAYLOAD.FA.fromBits(int64.asBits.resize(config.totalWidth))
           }
           when(FETCH.PAYLOAD.opcode === FpuOperation.I32TOR32 || FETCH.PAYLOAD.opcode === FpuOperation.I32TOR64) {
             val int32 = S(FETCH.PAYLOAD.FA.asBits(31 downto 0))
@@ -642,9 +667,7 @@ class T9000Fpu(config: FPUConfig) extends PluginHost {
             FETCH.PAYLOAD.result := FloatData(config).fromBits(Cat(FETCH.PAYLOAD.FA.asBits(31 downto 0), B"0".resize(29)))
           }
         }
-        is(MicrocodeOp.DUP) {
-          stackPlugin.logic.push(FETCH.PAYLOAD.FA, FETCH.PAYLOAD.status.typeFPAreg)
-        }
+        is(MicrocodeOp.DUP) { stackPlugin.logic.push(FETCH.PAYLOAD.FA, FETCH.PAYLOAD.status.typeFPAreg) }
         is(MicrocodeOp.REV) {
           val temp = FETCH.PAYLOAD.FA
           FETCH.PAYLOAD.FA := FETCH.PAYLOAD.FB
@@ -653,106 +676,64 @@ class T9000Fpu(config: FPUConfig) extends PluginHost {
           FETCH.PAYLOAD.status.typeFPAreg := FETCH.PAYLOAD.status.typeFPBreg
           FETCH.PAYLOAD.status.typeFPBreg := tempType
         }
-        is(MicrocodeOp.SETROUND) {
-          FETCH.PAYLOAD.status.roundingMode := microInst.srcA.asUInt
-        }
-        is(MicrocodeOp.CHECKERR) {
-          when(FETCH.PAYLOAD.status.invalid && FETCH.PAYLOAD.status.trapEnableInvalid) {
-            FETCH.PAYLOAD.status.invalid := True
-          }
-        }
-        is(MicrocodeOp.TESTERR) {
-          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(FETCH.PAYLOAD.status.invalid, 64 bits))
-          FETCH.PAYLOAD.status.invalid := False
-        }
-        is(MicrocodeOp.SETERR) {
-          FETCH.PAYLOAD.status.invalid := True
-        }
-        is(MicrocodeOp.CLRERR) {
-          FETCH.PAYLOAD.status.clearAll()
-        }
+        is(MicrocodeOp.SETROUND) { FETCH.PAYLOAD.status.roundingMode := microInst.srcA.asUInt }
+        is(MicrocodeOp.CHECKERR) { when(FETCH.PAYLOAD.status.invalid && FETCH.PAYLOAD.status.trapEnableInvalid) { FETCH.PAYLOAD.status.invalid := True } }
+        is(MicrocodeOp.TESTERR) { FETCH.PAYLOAD.intermediate.tempA := FETCH.PAYLOAD.FA.fromBits(B(FETCH.PAYLOAD.status.invalid, 64 bits)); FETCH.PAYLOAD.status.invalid := False }
+        is(MicrocodeOp.SETERR) { FETCH.PAYLOAD.status.invalid := True }
+        is(MicrocodeOp.CLRERR) { FETCH.PAYLOAD.status.clearAll() }
         is(MicrocodeOp.CMPGT) {
           val diff = adderSubPlugin.logic.io.opA.exponent - adderSubPlugin.logic.io.opB.exponent
           val mantDiff = S(FETCH.PAYLOAD.FA.normalizedMantissa) - S(FETCH.PAYLOAD.FB.normalizedMantissa)
-          val gt = (FETCH.PAYLOAD.FA.sign === FETCH.PAYLOAD.FB.sign) ?
-                   (diff > 0 || (diff === 0 && mantDiff > 0)) |
-                   (FETCH.PAYLOAD.FA.sign === False && FETCH.PAYLOAD.FB.sign === True)
-          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(gt, 64 bits))
+          val gt = (FETCH.PAYLOAD.FA.sign === FETCH.PAYLOAD.FB.sign) ? (diff > 0 || (diff === 0 && mantDiff > 0)) | (FETCH.PAYLOAD.FA.sign === False && FETCH.PAYLOAD.FB.sign === True)
+          FETCH.PAYLOAD.intermediate.tempA := FETCH.PAYLOAD.FA.fromBits(B(gt, 64 bits))
         }
-        is(MicrocodeOp.CMPEQ) {
-          val eq = FETCH.PAYLOAD.FA.asBits === FETCH.PAYLOAD.FB.asBits
-          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(eq, 64 bits))
-        }
-        is(MicrocodeOp.CMPORDER) {
-          val ordered = !FETCH.PAYLOAD.FA.isNaN && !FETCH.PAYLOAD.FB.isNaN
-          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(ordered, 64 bits))
-        }
-        is(MicrocodeOp.CMPNAN) {
-          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(FETCH.PAYLOAD.FA.isNaN, 64 bits))
-        }
-        is(MicrocodeOp.CMPNOTFINITE) {
-          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(!FETCH.PAYLOAD.FA.isFinite, 64 bits))
-        }
+        is(MicrocodeOp.CMPEQ) { FETCH.PAYLOAD.intermediate.tempA := FETCH.PAYLOAD.FA.fromBits(B(FETCH.PAYLOAD.FA.asBits === FETCH.PAYLOAD.FB.asBits, 64 bits)) }
+        is(MicrocodeOp.CMPORDER) { FETCH.PAYLOAD.intermediate.tempA := FETCH.PAYLOAD.FA.fromBits(B(!FETCH.PAYLOAD.FA.isNaN && !FETCH.PAYLOAD.FB.isNaN, 64 bits)) }
+        is(MicrocodeOp.CMPNAN) { FETCH.PAYLOAD.intermediate.tempA := FETCH.PAYLOAD.FA.fromBits(B(FETCH.PAYLOAD.FA.isNaN, 64 bits)) }
+        is(MicrocodeOp.CMPNOTFINITE) { FETCH.PAYLOAD.intermediate.tempA := FETCH.PAYLOAD.FA.fromBits(B(!FETCH.PAYLOAD.FA.isFinite, 64 bits)) }
         is(MicrocodeOp.CHKI) {
           val intVal = S(FETCH.PAYLOAD.FA.normalizedMantissa) << (FETCH.PAYLOAD.FA.exponent.toSInt - config.bias)
-          val inRange = if (FETCH.PAYLOAD.opcode === FpuOperation.CHKI32)
-                          intVal >= S(-2147483648) && intVal <= S(2147483647)
-                        else
-                          intVal >= S(-9223372036854775808L) && intVal <= S(9223372036854775807L)
-          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(inRange, 64 bits))
+          val inRange = if (FETCH.PAYLOAD.opcode === FpuOperation.CHKI32) intVal >= S(-2147483648) && intVal <= S(2147483647) else intVal >= S(-9223372036854775808L) && intVal <= S(9223372036854775807L)
+          FETCH.PAYLOAD.intermediate.tempA := FETCH.PAYLOAD.FA.fromBits(B(inRange, 64 bits))
         }
-        is(MicrocodeOp.ABS) {
-          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA
-          FETCH.PAYLOAD.result.sign := False
-        }
-        is(MicrocodeOp.EXPINC32) {
-          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA
-          FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.FA.exponent + 32
-          FETCH.PAYLOAD.status.overflow := FETCH.PAYLOAD.result.exponent >= config.maxExponent
-        }
-        is(MicrocodeOp.EXPDEC32) {
-          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA
-          FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.FA.exponent - 32
-          FETCH.PAYLOAD.status.underflow := FETCH.PAYLOAD.result.exponent <= 0
-        }
-        is(MicrocodeOp.MULBY2) {
-          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA
-          FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.FA.exponent + 1
-          FETCH.PAYLOAD.status.overflow := FETCH.PAYLOAD.result.exponent >= config.maxExponent
-        }
-        is(MicrocodeOp.DIVBY2) {
-          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA
-          FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.FA.exponent - 1
-          FETCH.PAYLOAD.status.underflow := FETCH.PAYLOAD.result.exponent <= 0
-        }
-        is(MicrocodeOp.R32TOR64) {
-          FETCH.PAYLOAD.result := FloatData(config).fromBits(Cat(FETCH.PAYLOAD.FA.asBits(31 downto 0), B"0".resize(29)))
-        }
-        is(MicrocodeOp.R64TOR32) {
-          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(FETCH.PAYLOAD.FA.asBits(63 downto 29))
-        }
-        is(MicrocodeOp.NOROUND) {
-          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(FETCH.PAYLOAD.FA.asBits(63 downto 29))
-        }
-        is(MicrocodeOp.INTOP) {
+        is(MicrocodeOp.ABS) { FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA; FETCH.PAYLOAD.result.sign := False }
+        is(MicrocodeOp.EXPINC32) { FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA; FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.FA.exponent + 32; FETCH.PAYLOAD.status.overflow := FETCH.PAYLOAD.result.exponent >= config.maxExponent }
+        is(MicrocodeOp.EXPDEC32) { FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA; FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.FA.exponent - 32; FETCH.PAYLOAD.status.underflow := FETCH.PAYLOAD.result.exponent <= 0 }
+        is(MicrocodeOp.MULBY2) { FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA; FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.FA.exponent + 1; FETCH.PAYLOAD.status.overflow := FETCH.PAYLOAD.result.exponent >= config.maxExponent }
+        is(MicrocodeOp.DIVBY2) { FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA; FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.FA.exponent - 1; FETCH.PAYLOAD.status.underflow := FETCH.PAYLOAD.result.exponent <= 0 }
+        is(MicrocodeOp.R32TOR64) { FETCH.PAYLOAD.result := FloatData(config).fromBits(Cat(FETCH.PAYLOAD.FA.asBits(31 downto 0), B"0".resize(29))) }
+        is(MicrocodeOp.R64TOR32) { FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(FETCH.PAYLOAD.FA.asBits(63 downto 29)) }
+        is(MicrocodeOp.NOROUND) { FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(FETCH.PAYLOAD.FA.asBits(63 downto 29)) }
+        is(MicrocodeOp.INTOP) { 
           val intPart = S(FETCH.PAYLOAD.FA.normalizedMantissa) << (FETCH.PAYLOAD.FA.exponent.toSInt - config.bias)
           FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(intPart.asBits.resize(config.totalWidth))
         }
         is(MicrocodeOp.REM) {
-          val temp = Reg(SInt(config.totalWidth bits))
+          val tempRemainder = Reg(SInt(config.totalWidth bits))
+          val counter = Reg(UInt(log2Up(config.mantissaWidth + 1) bits))
           when(FETCH.PAYLOAD.microPc === 1) {
-            temp := S(FETCH.PAYLOAD.FA.normalizedMantissa) << (FETCH.PAYLOAD.FA.exponent.toSInt - config.bias)
-          } elsewhen(FETCH.PAYLOAD.FA.exponent >= FETCH.PAYLOAD.FB.exponent) {
-            temp := temp - (S(FETCH.PAYLOAD.FB.normalizedMantissa) << (FETCH.PAYLOAD.FB.exponent.toSInt - config.bias))
+            tempRemainder := S(FETCH.PAYLOAD.FA.normalizedMantissa) << (FETCH.PAYLOAD.FA.exponent.toSInt - config.bias)
+            counter := 0
+          } elsewhen(counter < (if (config.isSinglePrecision) 3 else config.mantissaWidth - 2)) {
+            val divisorShifted = S(FETCH.PAYLOAD.FB.normalizedMantissa) << (FETCH.PAYLOAD.FB.exponent.toSInt - config.bias)
+            when(tempRemainder >= divisorShifted) { tempRemainder := tempRemainder - divisorShifted }
+            counter := counter + 1
           }
-          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(temp.asBits.resize(config.totalWidth))
-          FETCH.PAYLOAD.status.inexact := True
+          FETCH.PAYLOAD.intermediate.tempA := FETCH.PAYLOAD.FA.fromBits(tempRemainder.asBits.resize(config.totalWidth))
+          FETCH.PAYLOAD.intermediate.tempB := FETCH.PAYLOAD.FA.fromBits(counter.asBits.resize(config.totalWidth))
+          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(tempRemainder.asBits.resize(config.totalWidth))
         }
       }
       FETCH.PAYLOAD.microPc := microInst.nextPc
-      when(FETCH.PAYLOAD.microPc =/= 0 && !(FETCH.PAYLOAD.opcode === FpuOperation.DIV || FETCH.PAYLOAD.opcode === FpuOperation.SQRT)) { haltIt() }
-      when(FETCH.PAYLOAD.opcode === FpuOperation.DIV || FETCH.PAYLOAD.opcode === FpuOperation.SQRT) {
-        when(dividerSqrtPlugin.logic.io.counterOut < (if (FETCH.PAYLOAD.opcode === FpuOperation.SQRT) config.mantissaWidth / 2 - 1 else config.mantissaWidth - 2)) { haltIt() }
+      when(FETCH.PAYLOAD.microPc =/= 0 && !(FETCH.PAYLOAD.opcode === FpuOperation.DIV || FETCH.PAYLOAD.opcode === FpuOperation.SQRT || FETCH.PAYLOAD.opcode === FpuOperation.REM)) { haltIt() }
+      when(FETCH.PAYLOAD.opcode === FpuOperation.DIV || FETCH.PAYLOAD.opcode === FpuOperation.SQRT || FETCH.PAYLOAD.opcode === FpuOperation.REM) {
+        when(config.isSinglePrecision) {
+          when(FETCH.PAYLOAD.opcode === FpuOperation.DIV && dividerSqrtPlugin.logic.io.counter < 3) { haltIt() }  // 5 cycles
+          when(FETCH.PAYLOAD.opcode === FpuOperation.SQRT && dividerSqrtPlugin.logic.io.counter < 6) { haltIt() }  // 8 cycles
+          when(FETCH.PAYLOAD.opcode === FpuOperation.REM && dividerSqrtPlugin.logic.io.counter < 3) { haltIt() }  // 5 cycles
+        } otherwise {
+          when(dividerSqrtPlugin.logic.io.counter < (if (FETCH.PAYLOAD.opcode === FpuOperation.SQRT) config.mantissaWidth / 2 - 1 else config.mantissaWidth - 2)) { haltIt() }  // 15 cycles
+        }
       }
     }
 
@@ -767,14 +748,44 @@ class T9000Fpu(config: FPUConfig) extends PluginHost {
       dividerSqrtPlugin.logic.io.isSquareRoot := FETCH.PAYLOAD.opcode === FpuOperation.SQRT
       dividerSqrtPlugin.logic.io.status := FETCH.PAYLOAD.status
       dividerSqrtPlugin.logic.io.finalize := False
-      dividerSqrtPlugin.logic.io.partialRemainderIn := FETCH.PAYLOAD.tempA.asBits.asSInt
-      dividerSqrtPlugin.logic.io.quotientIn := FETCH.PAYLOAD.tempB.asBits.asUInt
-      dividerSqrtPlugin.logic.io.counterIn := dividerSqrtPlugin.logic.io.counterOut
+      dividerSqrtPlugin.logic.io.partialRemainderIn := FETCH.PAYLOAD.intermediate.tempA.asBits.asSInt
+      dividerSqrtPlugin.logic.io.quotientIn := FETCH.PAYLOAD.intermediate.tempB.asBits.asUInt
+      dividerSqrtPlugin.logic.io.counterIn := dividerSqrtPlugin.logic.io.counter
+
+      multiplierPlugin.logic.io.opA := FETCH.PAYLOAD.FA
+      multiplierPlugin.logic.io.opB := FETCH.PAYLOAD.FB
+      multiplierPlugin.logic.io.status := FETCH.PAYLOAD.status
+      multiplierPlugin.logic.io.stage := Mux(config.isSinglePrecision, 2, 1)
+      multiplierPlugin.logic.io.partialProductsIn := FETCH.PAYLOAD.intermediate.partialProducts
+      multiplierPlugin.logic.io.signIn := FETCH.PAYLOAD.result.sign
+      multiplierPlugin.logic.io.expIn := FETCH.PAYLOAD.result.exponent
+      multiplierPlugin.logic.io.partialSumIn := FETCH.PAYLOAD.intermediate.partialSum
 
       when(FETCH.PAYLOAD.opcode === FpuOperation.DIV || FETCH.PAYLOAD.opcode === FpuOperation.SQRT) {
         FETCH.PAYLOAD.result := dividerSqrtPlugin.logic.io.result
-        FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(dividerSqrtPlugin.logic.io.partialRemainderOut.asBits.resize(config.totalWidth))
-        FETCH.PAYLOAD.tempB := FETCH.PAYLOAD.FA.fromBits(dividerSqrtPlugin.logic.io.quotientOut.asBits.resize(config.totalWidth))
+        FETCH.PAYLOAD.intermediate.tempA := FETCH.PAYLOAD.FA.fromBits(dividerSqrtPlugin.logic.io.partialRemainder.asBits.resize(config.totalWidth))
+        FETCH.PAYLOAD.intermediate.tempB := FETCH.PAYLOAD.FA.fromBits(dividerSqrtPlugin.logic.io.quotient.asBits.resize(config.totalWidth))
+      }
+      when(FETCH.PAYLOAD.opcode === FpuOperation.REM) {
+        val tempRemainder = S(FETCH.PAYLOAD.intermediate.tempA.asBits.asSInt)
+        val counter = FETCH.PAYLOAD.intermediate.tempB.asBits.asUInt
+        val divisorShifted = S(FETCH.PAYLOAD.FB.normalizedMantissa) << (FETCH.PAYLOAD.FB.exponent.toSInt - config.bias)
+        when(counter < (if (config.isSinglePrecision) 4 else config.mantissaWidth - 1) && tempRemainder >= divisorShifted) {
+          tempRemainder := tempRemainder - divisorShifted
+        }
+        FETCH.PAYLOAD.intermediate.tempA := FETCH.PAYLOAD.FA.fromBits(tempRemainder.asBits.resize(config.totalWidth))
+        FETCH.PAYLOAD.intermediate.tempB := FETCH.PAYLOAD.FA.fromBits((counter + 1).asBits.resize(config.totalWidth))
+        FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(tempRemainder.asBits.resize(config.totalWidth))
+      }
+      when(FETCH.PAYLOAD.opcode === FpuOperation.MUL) {
+        when(config.isSinglePrecision) {
+          FETCH.PAYLOAD.result := multiplierPlugin.logic.io.result
+          FETCH.PAYLOAD.status := multiplierPlugin.logic.io.outStatus
+        } otherwise {
+          FETCH.PAYLOAD.intermediate.partialSum := multiplierPlugin.logic.io.partialSum
+          FETCH.PAYLOAD.result.sign := multiplierPlugin.logic.io.sign
+          FETCH.PAYLOAD.result.exponent := multiplierPlugin.logic.io.exp
+        }
       }
     }
 
@@ -796,13 +807,36 @@ class T9000Fpu(config: FPUConfig) extends PluginHost {
       dividerSqrtPlugin.logic.io.isSquareRoot := FETCH.PAYLOAD.opcode === FpuOperation.SQRT
       dividerSqrtPlugin.logic.io.status := FETCH.PAYLOAD.status
       dividerSqrtPlugin.logic.io.finalize := FETCH.PAYLOAD.opcode === FpuOperation.DIV || FETCH.PAYLOAD.opcode === FpuOperation.SQRT
-      dividerSqrtPlugin.logic.io.partialRemainderIn := FETCH.PAYLOAD.tempA.asBits.asSInt
-      dividerSqrtPlugin.logic.io.quotientIn := FETCH.PAYLOAD.tempB.asBits.asUInt
-      dividerSqrtPlugin.logic.io.counterIn := dividerSqrtPlugin.logic.io.counterOut
+      dividerSqrtPlugin.logic.io.partialRemainderIn := FETCH.PAYLOAD.intermediate.tempA.asBits.asSInt
+      dividerSqrtPlugin.logic.io.quotientIn := FETCH.PAYLOAD.intermediate.tempB.asBits.asUInt
+      dividerSqrtPlugin.logic.io.counterIn := dividerSqrtPlugin.logic.io.counter
+
+      multiplierPlugin.logic.io.opA := FETCH.PAYLOAD.FA
+      multiplierPlugin.logic.io.opB := FETCH.PAYLOAD.FB
+      multiplierPlugin.logic.io.status := FETCH.PAYLOAD.status
+      multiplierPlugin.logic.io.stage := Mux(config.isSinglePrecision, 0, 2)
+      multiplierPlugin.logic.io.partialProductsIn := FETCH.PAYLOAD.intermediate.partialProducts
+      multiplierPlugin.logic.io.signIn := FETCH.PAYLOAD.result.sign
+      multiplierPlugin.logic.io.expIn := FETCH.PAYLOAD.result.exponent
+      multiplierPlugin.logic.io.partialSumIn := FETCH.PAYLOAD.intermediate.partialSum
 
       when(FETCH.PAYLOAD.opcode === FpuOperation.DIV || FETCH.PAYLOAD.opcode === FpuOperation.SQRT) {
         FETCH.PAYLOAD.result := dividerSqrtPlugin.logic.io.result
         FETCH.PAYLOAD.status := dividerSqrtPlugin.logic.io.outStatus
+      }
+      when(FETCH.PAYLOAD.opcode === FpuOperation.REM) {
+        val tempRemainder = S(FETCH.PAYLOAD.intermediate.tempA.asBits.asSInt)
+        val counter = FETCH.PAYLOAD.intermediate.tempB.asBits.asUInt
+        val divisorShifted = S(FETCH.PAYLOAD.FB.normalizedMantissa) << (FETCH.PAYLOAD.FB.exponent.toSInt - config.bias)
+        when(counter < config.mantissaWidth && tempRemainder >= divisorShifted) {
+          tempRemainder := tempRemainder - divisorShifted
+        }
+        FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(tempRemainder.asBits.resize(config.totalWidth))
+        FETCH.PAYLOAD.status.inexact := True
+      }
+      when(FETCH.PAYLOAD.opcode === FpuOperation.MUL && !config.isSinglePrecision) {
+        FETCH.PAYLOAD.result := multiplierPlugin.logic.io.result
+        FETCH.PAYLOAD.status := multiplierPlugin.logic.io.outStatus
       }
     }
 
@@ -818,33 +852,41 @@ class T9000Fpu(config: FPUConfig) extends PluginHost {
 
 // Simulation
 object T9000FpuSim extends App {
-  SimConfig.withVerilator.compile(new T9000Fpu(FPUConfig(64))).doSim { dut =>
+  def runTests(config: FPUConfig) = SimConfig.withVerilator.compile(new T9000Fpu(config)).doSim { dut =>
     dut.clockDomain.forkStimulus(period = 10)
-    
-    // Test case: Subtract 0.5 from 1.0 (double precision)
-    dut.io.inputA #= 0x3FF0000000000000L  // 1.0
-    dut.io.inputB #= 0x3FE0000000000000L  // 0.5
-    dut.io.inputC #= 0x0000000000000000L  // 0.0 (unused)
-    dut.io.operation #= FpuOperation.SUB
-    dut.io.memAddress #= 0
-    
-    waitUntil(dut.io.ready.toBoolean)
-    println(s"Result: ${dut.io.result.toBigInt.toString(16)}")  // Expected: 0x3FE0000000000000 (0.5)
-    
-    // Test case: Divide 1.0 by 2.0 (double precision)
-    dut.io.inputA #= 0x3FF0000000000000L  // 1.0
-    dut.io.inputB #= 0x4000000000000000L  // 2.0
-    dut.io.operation #= FpuOperation.DIV
-    
-    waitUntil(dut.io.ready.toBoolean)
-    println(s"Divide Result: ${dut.io.result.toBigInt.toString(16)}")  // Expected: 0x3FE0000000000000 (0.5)
-    
-    // Test case: Square root of 4.0 (double precision)
-    dut.io.inputA #= 0x4010000000000000L  // 4.0
-    dut.io.inputB #= 0x0000000000000000L  // 0.0 (unused)
-    dut.io.operation #= FpuOperation.SQRT
-    
-    waitUntil(dut.io.ready.toBoolean)
-    println(s"Sqrt Result: ${dut.io.result.toBigInt.toString(16)}")  // Expected: 0x4000000000000000 (2.0)
+    var cycleCount = 0
+    dut.clockDomain.onSamplings { cycleCount += 1 }
+
+    def resetAndRun(op: FpuOperation.E, inputA: Long, inputB: Long, expected: Long, desc: String, cycles: Int): Unit = {
+      dut.io.inputA #= inputA
+      dut.io.inputB #= inputB
+      dut.io.inputC #= 0x0000000000000000L
+      dut.io.operation #= op
+      dut.io.memAddress #= 0
+      cycleCount = 0
+      waitUntil(dut.io.ready.toBoolean)
+      println(s"$desc: Result = 0x${dut.io.result.toBigInt.toString(16)}, Expected = 0x${expected.toString(16)}, Cycles = $cycleCount")
+      assert(dut.io.result.toBigInt == expected, s"$desc failed!")
+      assert(cycleCount == cycles, s"$desc cycle count mismatch: expected $cycles, got $cycleCount")
+    }
+
+    if (config.isSinglePrecision) {
+      resetAndRun(FpuOperation.ADD, 0x3F800000, 0x3F800000, 0x40000000, "ADD 1.0 + 1.0 (single)", 2)
+      resetAndRun(FpuOperation.SUB, 0x40000000, 0x3F800000, 0x3F800000, "SUB 2.0 - 1.0 (single)", 2)
+      resetAndRun(FpuOperation.MUL, 0x3F800000, 0x40000000, 0x40000000, "MUL 1.0 * 2.0 (single)", 2)
+      resetAndRun(FpuOperation.DIV, 0x3F800000, 0x40000000, 0x3F000000, "DIV 1.0 / 2.0 (single)", 5)
+      resetAndRun(FpuOperation.SQRT, 0x40800000, 0x00000000, 0x40000000, "SQRT 4.0 (single)", 8)
+      resetAndRun(FpuOperation.REM, 0x40C00000, 0x40400000, 0x40000000, "REM 6.0 % 3.0 (single)", 5)
+    } else {
+      resetAndRun(FpuOperation.ADD, 0x3FF0000000000000L, 0x3FF0000000000000L, 0x4000000000000000L, "ADD 1.0 + 1.0 (double)", 3)
+      resetAndRun(FpuOperation.SUB, 0x4000000000000000L, 0x3FF0000000000000L, 0x3FF0000000000000L, "SUB 2.0 - 1.0 (double)", 3)
+      resetAndRun(FpuOperation.MUL, 0x3FF0000000000000L, 0x4000000000000000L, 0x4008000000000000L, "MUL 1.0 * 2.0 (double)", 3)
+      resetAndRun(FpuOperation.DIV, 0x3FF0000000000000L, 0x4000000000000000L, 0x3FE0000000000000L, "DIV 1.0 / 2.0 (double)", 15)
+      resetAndRun(FpuOperation.SQRT, 0x4010000000000000L, 0x0000000000000000L, 0x4000000000000000L, "SQRT 4.0 (double)", 15)
+      resetAndRun(FpuOperation.REM, 0x4018000000000000L, 0x4008000000000000L, 0x3FF0000000000000L, "REM 6.0 % 3.0 (double)", 15)
+    }
   }
+
+  runTests(FPUConfig(32))  // Single precision
+  runTests(FPUConfig(64))  // Double precision
 }
