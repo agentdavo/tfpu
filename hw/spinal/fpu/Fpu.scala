@@ -1,573 +1,850 @@
-// SPDX-FileCopyrightText: 2025 David Smith <david.smith@linux.com>
-// SPDX-License-Identifier: MIT
-
 package fpu
 
 import spinal.core._
 import spinal.lib._
+import spinal.lib.fsm._
+import spinal.lib.misc.plugin._
 import spinal.lib.misc.pipeline._
 
-class FPU extends Component {
+// Configuration
+case class FPUConfig(precision: Int = 64) {
+  val isSinglePrecision = precision == 32
+  val mantissaWidth = if (isSinglePrecision) 23 else 52
+  val exponentWidth = if (isSinglePrecision) 8 else 11
+  val totalWidth = 1 + exponentWidth + mantissaWidth
+  val bias = if (isSinglePrecision) 127 else 1023
+  val maxExponent = (1 << exponentWidth) - 1
+  val minExponent = -bias + 1
+  val clockFreqMHz = 50
+}
+
+// IEEE-754 Float Data
+case class FloatData(config: FPUConfig) extends Bundle {
+  val sign = Bool()  // IEEE-754 Sign Bit: 0=positive, 1=negative
+  val exponent = UInt(config.exponentWidth bits)  // IEEE-754 Exponent: biased by config.bias
+  val mantissa = UInt(config.mantissaWidth bits)  // IEEE-754 Mantissa: implicit leading 1 for normalized
+
+  def asBits: Bits = Cat(sign, exponent, mantissa)
+  def fromBits(bits: Bits): FloatData = {
+    val result = FloatData(config)
+    result.sign := bits(config.totalWidth - 1)
+    result.exponent := bits(config.totalWidth - 2 downto config.mantissaWidth)
+    result.mantissa := bits(config.mantissaWidth - 1 downto 0)
+    result
+  }
+  def isZero: Bool = exponent === 0 && mantissa === 0
+  def isDenormal: Bool = exponent === 0 && mantissa =/= 0
+  def isInfinity: Bool = exponent === U(config.maxExponent) && mantissa === 0
+  def isNaN: Bool = exponent === U(config.maxExponent) && mantissa =/= 0
+  def isSignalingNaN: Bool = isNaN && !mantissa(config.mantissaWidth - 1)  // MSB = 0 for signaling NaN
+  def isFinite: Bool = !isInfinity && !isNaN
+  def normalizedMantissa: UInt = Cat(True, mantissa)
+}
+
+// FPU Status
+case class FPUStatus() extends Bundle {
+  val roundingMode = UInt(2 bits)  // 0=Zero, 1=Nearest, 2=+Inf, 3=-Inf
+  val typeFPAreg, typeFPBreg, typeFPCreg = UInt(2 bits)  // 0=Single, 1=Double
+  val reserved = Bits(24 bits)
+  val overflow, underflow, inexact, invalid, divideByZero = Bool()
+  val trapEnableOverflow, trapEnableUnderflow, trapEnableInexact, trapEnableInvalid, trapEnableDivideByZero = Bool()
+  val unalign, accessViolation = Bool()
+
+  def clearAll(): Unit = {
+    roundingMode := 1; typeFPAreg := 0; typeFPBreg := 0; typeFPCreg := 0
+    reserved := 0; overflow := False; underflow := False; inexact := False
+    invalid := False; divideByZero := False; unalign := False; accessViolation := False
+    trapEnableOverflow := False; trapEnableUnderflow := False; trapEnableInexact := False
+    trapEnableInvalid := False; trapEnableDivideByZero := False
+  }
+}
+
+// Enums
+object FpuOperation extends SpinalEnum {
+  val LDLNSN, LDNLDB, LDNLSNI, LDNLDBI, LDZEROSN, LDZERODB, LDNLADDSN, LDNLADDDB, LDNLMULSN, LDNLMULDB,
+  STNLSN, STNLDB, STNLI32, STALL, ENTRY, REV, DUP, RN, RZ, RP, RM, CHKERR, TESTERR, SETERR, CLRERR, GT, EQ,
+  ORDERED, NAN, NOTFINITE, CHKI32, CHKI64, R32TOR64, R64TOR32, RTOI32, I32TOR32, I32TOR64, B32TOR64,
+  NOROUND, INT, ADD, SUB, MUL, DIV, ABS, EXPINC32, EXPDEC32, MULBY2, DIVBY2, SQRTFIRST, SQRTSTEP,
+  SQRTLAST, REMFIRST, REMSTEP, REM, SQRT, RANGE, GE, LG, NONE = newElement()
+}
+
+object MicrocodeOp extends SpinalEnum {
+  val LOAD, STORE, ADD, SUB, MUL, DIV, SQRT, NORM, ROUND, FINALIZE, CONVERT, EXPINC32, REM, DUP, REV,
+  SETROUND, CHECKERR, TESTERR, SETERR, CLRERR, CMPGT, CMPEQ, CMPORDER, CMPNAN, CMPNOTFINITE, CHKI,
+  ABS, MULBY2, DIVBY2, R32TOR64, R64TOR32, NOROUND, INTOP = newElement()
+}
+
+case class MicrocodeInstruction() extends Bundle {
+  val op = MicrocodeOp()
+  val srcA, srcB, dest = UInt(4 bits)  // 0=unused, 1=FA, 2=FB, 3=FC, 4=TempA, 5=TempB
+  val nextPc = UInt(6 bits)
+}
+
+// Payload
+case class FpuPayload(config: FPUConfig) extends Bundle {
+  val FA, FB, FC = new FloatData(config)
+  val opcode = FpuOperation()
+  val microPc = UInt(6 bits)
+  val result = new FloatData(config)
+  val status = new FPUStatus()
+  val tempA, tempB = new FloatData(config)  // Used for state passing (e.g., remainder, quotient)
+}
+
+// Stack Plugin
+class FPUStackPlugin(config: FPUConfig) extends FiberPlugin {
+  val logic = during build { new Area {
+    val stack = Vec(Reg(new FloatData(config)), 3)  // FA, FB, FC
+    val types = Vec(Reg(UInt(2 bits)), 3)  // 0=Single, 1=Double
+    val tempA, tempB = Reg(new FloatData(config))
+
+    def push(data: FloatData, precision: UInt): Unit = {
+      stack(1) := stack(0); stack(2) := stack(1); stack(0) := data
+      types(1) := types(0); types(2) := types(1); types(0) := precision
+    }
+
+    def pop(): Unit = {
+      stack(0) := stack(1); stack(1) := stack(2)
+      types(0) := types(1); types(1) := types(2)
+    }
+  }}
+}
+
+// VCU Plugin
+class VCUPlugin(config: FPUConfig) extends FiberPlugin {
+  val logic = during build { new Area {
+    val io = new Bundle {
+      val operandA, operandB = in(new FloatData(config))
+      val opcode = in(FpuOperation())
+      val result = out(new FloatData(config))
+      val abort = out Bool()
+      val status = out(FPUStatus())
+    }
+
+    val status = new FPUStatus()
+    status.clearAll()
+    val floatA = io.operandA
+    val floatB = io.operandB
+    io.abort := floatA.isNaN || floatB.isNaN || floatA.isInfinity || floatB.isInfinity || floatA.isDenormal || floatB.isDenormal
+
+    io.result := MuxCase(floatA, Seq(
+      (floatA.isSignalingNaN) -> floatA.fromBits(floatA.asBits | (B"1" << config.mantissaWidth - 1)),
+      (floatB.isSignalingNaN) -> floatB.fromBits(floatB.asBits | (B"1" << config.mantissaWidth - 1)),
+      (floatA.isNaN) -> floatA,
+      (floatB.isNaN) -> floatB,
+      (floatA.isInfinity && floatB.isInfinity && io.opcode === FpuOperation.DIV) -> floatA.fromBits(B"0x7FFC000000000000"),
+      (floatA.isInfinity && floatB.isInfinity && io.opcode === FpuOperation.SUB && floatA.sign =/= floatB.sign) -> floatA.fromBits(B"0x7FF8000000000000")  // AddOpInfsNaN
+    ))
+    status.invalid := floatA.isNaN || floatB.isNaN || (floatA.isInfinity && floatB.isInfinity && io.opcode === FpuOperation.SUB && floatA.sign =/= floatB.sign)
+    status.divideByZero := floatA.isFinite && floatB.isZero && io.opcode === FpuOperation.DIV
+    io.status := status
+  }}
+}
+
+// Adder/Subtractor Plugin
+class AdderSubtractorPlugin(config: FPUConfig) extends FiberPlugin {
+  val logic = during build { new Area {
+    val io = new Bundle {
+      val opA, opB = in(new FloatData(config))
+      val isSubtract = in Bool()
+      val status = in(FPUStatus())
+      val result = out(new FloatData(config))
+      val outStatus = out(FPUStatus())
+    }
+
+    // Twin alignment shifters for mantissas
+    val expDiff = (io.opA.exponent - io.opB.exponent).asSInt
+    val largerExp = Mux(expDiff >= 0, io.opA.exponent, io.opB.exponent)
+    val mantAExt = Cat(True, io.opA.mantissa, U"3'b000").asUInt  // Extended for guard, round, sticky
+    val mantBExt = Cat(True, io.opB.mantissa, U"3'b000").asUInt
+    val alignedMantB1 = mantBExt >> expDiff.abs  // First shifter
+    val alignedMantB2 = mantBExt >> (expDiff.abs + 1)  // Second shifter for NDP
+
+    // Addition/Subtraction with NDP (near-difference path)
+    val sumNoOverflow = (mantAExt.asSInt + (if (io.isSubtract) -alignedMantB1.asSInt else alignedMantB1.asSInt)).asUInt
+    val sumWithOverflow = (mantAExt.asSInt + (if (io.isSubtract) -alignedMantB2.asSInt else alignedMantB2.asSInt)).asUInt >> 1
+    val useOverflow = sumNoOverflow >= (2 << config.mantissaWidth)
+    val rawMantissa = Mux(useOverflow, sumWithOverflow, sumNoOverflow)
+
+    // Result computation
+    io.result.sign := io.opA.sign ^ io.opB.sign ^ io.isSubtract
+    io.result.exponent := largerExp + (if (useOverflow) 1 else 0)
+    io.result.mantissa := rawMantissa(config.mantissaWidth + 2 downto 3)
+
+    // Status update
+    io.outStatus := io.status
+    io.outStatus.overflow := io.result.exponent >= config.maxExponent
+    io.outStatus.underflow := io.result.exponent <= 0
+    io.outStatus.inexact := rawMantissa(2 downto 0) =/= 0
+  }}
+}
+
+// Multiplier Plugin with Booth Recoding and Twin-Array CSA
+class MultiplierPlugin(config: FPUConfig) extends FiberPlugin {
+  val logic = during build { new Area {
+    val io = new Bundle {
+      val opA, opB = in(new FloatData(config))
+      val status = in(FPUStatus())
+      val result = out(new FloatData(config))
+      val outStatus = out(FPUStatus())
+    }
+
+    // Prepare mantissas with implicit 1
+    val mantAExt = Cat(True, io.opA.mantissa).asUInt
+    val mantBExt = Cat(True, io.opB.mantissa).asUInt
+
+    // Radix-2 Booth recoding
+    val boothDigits = (0 until config.mantissaWidth / 2 + 2).map { i =>
+      val bits = Cat(
+        if (2 * i + 1 < config.mantissaWidth + 1) mantBExt(2 * i + 1) else False,
+        if (2 * i < config.mantissaWidth + 1) mantBExt(2 * i) else False,
+        if (i == 0) False else mantBExt(2 * i - 1)
+      )
+      MuxCase(S"2'b00", Seq(
+        (bits === U"3'b000") -> S"2'b00",
+        (bits === U"3'b001") -> S"2'b01",
+        (bits === U"3'b010") -> S"2'b01",
+        (bits === U"3'b011") -> S"2'b10",
+        (bits === U"3'b100") -> S"-2'b10",
+        (bits === U"3'b101") -> S"-2'b01",
+        (bits === U"3'b110") -> S"-2'b01",
+        (bits === U"3'b111") -> S"2'b00"
+      )).asSInt
+    }
+
+    // Generate partial products
+    val partialProducts = boothDigits.zipWithIndex.map { case (digit, i) =>
+      val pp = MuxCase(U"0", Seq(
+        (digit === 0) -> U"0",
+        (digit === 1) -> mantAExt,
+        (digit === 2) -> (mantAExt << 1),
+        (digit === -1) -> (-mantAExt),
+        (digit === -2) -> (-(mantAExt << 1))
+      )).asUInt << (2 * i)
+      pp.resize(config.mantissaWidth * 2 + 4)
+    }
+
+    // Twin-array CSA tree reduction
+    def csa(a: UInt, b: UInt, c: UInt): (UInt, UInt) = {
+      val sum = a ^ b ^ c
+      val carry = (a & b) | (b & c) | (a & c)
+      (sum, carry << 1)
+    }
+
+    def csaTree(products: Seq[UInt]): UInt = {
+      if (products.length <= 2) products.reduce(_ + _)
+      else {
+        val grouped = products.grouped(3).toSeq.map {
+          case Seq(a, b, c) => csa(a, b, c)
+          case Seq(a, b) => (a + b, U"0")
+          case Seq(a) => (a, U"0")
+        }
+        val sums = grouped.map(_._1)
+        val carries = grouped.map(_._2)
+        csaTree(sums) + csaTree(carries)
+      }
+    }
+
+    val product = csaTree(partialProducts)
+    val normalizedProduct = product(config.mantissaWidth * 2 + 2 downto config.mantissaWidth)
+    val expResult = io.opA.exponent + io.opB.exponent - config.bias + (if (product(config.mantissaWidth * 2 + 3)) 1 else 0)
+
+    io.result.sign := io.opA.sign ^ io.opB.sign
+    io.result.exponent := expResult
+    io.result.mantissa := normalizedProduct(config.mantissaWidth - 1 downto 0)
+
+    io.outStatus := io.status
+    io.outStatus.overflow := expResult >= config.maxExponent
+    io.outStatus.underflow := expResult <= 0
+    io.outStatus.inexact := product(config.mantissaWidth - 1 downto 0) =/= 0
+  }}
+}
+
+// Divider/Square Root Plugin with Retimed Radix-2 SRT
+class DividerSqrtPlugin(config: FPUConfig) extends FiberPlugin {
+  val logic = during build { new Area {
+    val io = new Bundle {
+      val dividend, divisor = in(new FloatData(config))
+      val isSquareRoot = in Bool()
+      val status = in(FPUStatus())
+      val result = out(new FloatData(config))
+      val outStatus = out(FPUStatus())
+      val partialRemainderOut = out(SInt(config.mantissaWidth + 4 bits))
+      val quotientOut = out(UInt(config.mantissaWidth + 4 bits))
+      val counterOut = out(UInt(log2Up(config.mantissaWidth + 1) bits))
+      val partialRemainderIn = in(SInt(config.mantissaWidth + 4 bits))
+      val quotientIn = in(UInt(config.mantissaWidth + 4 bits))
+      val counterIn = in(UInt(log2Up(config.mantissaWidth + 1) bits))
+      val finalize = in Bool()
+    }
+
+    val extWidth = config.mantissaWidth + 4
+    val partialRemainder = Reg(SInt(extWidth bits))
+    val quotient = Reg(UInt(extWidth bits))
+    val counter = Reg(UInt(log2Up(config.mantissaWidth + 1) bits))
+    val dividendMant = Cat(True, io.dividend.mantissa).asUInt
+    val divisorMant = Cat(True, io.divisor.mantissa).asUInt
+
+    when(io.finalize) {
+      // Final iteration in ROUND stage
+      partialRemainder := io.partialRemainderIn
+      quotient := io.quotientIn
+      counter := io.counterIn
+      io.result.sign := io.dividend.sign ^ (if (io.isSquareRoot) False else io.divisor.sign)
+      io.result.exponent := Mux(io.isSquareRoot,
+        (io.dividend.exponent + config.bias) >> 1,
+        io.dividend.exponent - io.divisor.exponent + config.bias)
+      io.result.mantissa := quotient(config.mantissaWidth + 2 downto 3)
+    } otherwise {
+      // Initial and intermediate iterations in MICROCODE and NORMALIZE
+      when(counter === 0) {
+        partialRemainder := (if (io.isSquareRoot) S(dividendMant) else S(dividendMant) << (config.mantissaWidth + 1)).resize(extWidth)
+        quotient := 0
+      } elsewhen(counter < (if (io.isSquareRoot) config.mantissaWidth / 2 else config.mantissaWidth)) {
+        val rShifted = partialRemainder << 2
+        val qLast = quotient(counter - 1 downto counter - 2)
+        val trialDivisor = Mux(io.isSquareRoot, Cat(U"2'b01", quotient.resize(config.mantissaWidth), U"2'b00").asUInt.resize(extWidth), divisorMant.resize(extWidth))
+        val trialSub = rShifted - (if (io.isSquareRoot) Cat(qLast, U"2'b11").asSInt else S(trialDivisor))
+        val qDigit = Mux(rShifted >= 0 && trialSub >= 0, S"2'b01", Mux(rShifted < 0 && trialSub < 0, S"2'b11", S"2'b00")).asSInt
+        partialRemainder := rShifted - (qDigit.abs.asUInt * trialDivisor)
+        quotient := (quotient << 2) | qDigit.abs
+      }
+      counter := counter + 1
+      io.result := io.dividend  // Placeholder during iterations
+    }
+
+    io.partialRemainderOut := partialRemainder
+    io.quotientOut := quotient
+    io.counterOut := counter
+    io.outStatus := io.status
+    io.outStatus.divideByZero := io.divisor.isZero && !io.isSquareRoot
+    io.outStatus.inexact := quotient(2 downto 0) =/= 0
+  }}
+}
+
+// Microcode ROM Plugin
+class MicrocodeROMPlugin(config: FPUConfig) extends FiberPlugin {
+  val logic = during build { new Area {
+    val io = new Bundle {
+      val operation = in(FpuOperation())
+      val address = in UInt(6 bits)
+      val instruction = out(MicrocodeInstruction())
+    }
+    val rom = Mem(MicrocodeInstruction(), 128)  // Increased size for all instructions
+    rom.initialContent = MicrocodeGenerator.generateMicrocode(config, io.operation).map(_.asBits.as(MicrocodeInstruction()))
+    io.instruction := rom.readSync(io.address)
+  }}
+
+  object MicrocodeGenerator {
+    def generateMicrocode(config: FPUConfig, operation: FpuOperation): Seq[Bits] = {
+      def instr(op: MicrocodeOp.E, srcA: Int, srcB: Int, dest: Int, next: Int): Bits =
+        U(op.id ## B(srcA, 4 bits) ## B(srcB, 4 bits) ## B(dest, 4 bits) ## B(next, 6 bits), 32 bits)
+
+      val base = Seq(instr(MicrocodeOp.LOAD, 1, 0, 0, 1))
+      operation match {
+        // Table 11.24: Load/Store Operations
+        case FpuOperation.LDLNSN => base ++ Seq(instr(MicrocodeOp.LOAD, 0, 0, 1, 0))
+        case FpuOperation.LDNLDB => base ++ Seq(instr(MicrocodeOp.LOAD, 0, 0, 1, 0))
+        case FpuOperation.LDNLSNI => base ++ Seq(instr(MicrocodeOp.LOAD, 0, 0, 1, 0))
+        case FpuOperation.LDNLDBI => base ++ Seq(instr(MicrocodeOp.LOAD, 0, 0, 1, 0))
+        case FpuOperation.LDZEROSN => base ++ Seq(instr(MicrocodeOp.LOAD, 0, 0, 1, 0))
+        case FpuOperation.LDZERODB => base ++ Seq(instr(MicrocodeOp.LOAD, 0, 0, 1, 0))
+        case FpuOperation.LDNLADDSN => base ++ Seq(
+          instr(MicrocodeOp.LOAD, 0, 0, 4, 2),
+          instr(MicrocodeOp.ADD, 1, 4, 1, 3),
+          instr(MicrocodeOp.NORM, 1, 0, 1, 4),
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
+        )
+        case FpuOperation.LDNLADDDB => base ++ Seq(
+          instr(MicrocodeOp.LOAD, 0, 0, 4, 2),
+          instr(MicrocodeOp.ADD, 1, 4, 1, 3),
+          instr(MicrocodeOp.NORM, 1, 0, 1, 4),
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
+        )
+        case FpuOperation.LDNLMULSN => base ++ Seq(
+          instr(MicrocodeOp.LOAD, 0, 0, 4, 2),
+          instr(MicrocodeOp.MUL, 1, 4, 1, 3),
+          instr(MicrocodeOp.NORM, 1, 0, 1, 4),
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
+        )
+        case FpuOperation.LDNLMULDB => base ++ Seq(
+          instr(MicrocodeOp.LOAD, 0, 0, 4, 2),
+          instr(MicrocodeOp.MUL, 1, 4, 1, 3),
+          instr(MicrocodeOp.NORM, 1, 0, 1, 4),
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
+        )
+        case FpuOperation.STNLSN => base ++ Seq(instr(MicrocodeOp.STORE, 1, 0, 0, 0))
+        case FpuOperation.STNLDB => base ++ Seq(instr(MicrocodeOp.STORE, 1, 0, 0, 0))
+        case FpuOperation.STNLI32 => base ++ Seq(
+          instr(MicrocodeOp.CONVERT, 1, 0, 4, 2),
+          instr(MicrocodeOp.STORE, 4, 0, 0, 0)
+        )
+        case FpuOperation.STALL => base ++ Seq(
+          instr(MicrocodeOp.STORE, 0, 0, 0, 1),  // Status
+          instr(MicrocodeOp.STORE, 1, 0, 0, 2),  // FA low
+          instr(MicrocodeOp.STORE, 1, 0, 0, 3),  // FA high (if double)
+          instr(MicrocodeOp.STORE, 2, 0, 0, 4),  // FB low
+          instr(MicrocodeOp.STORE, 2, 0, 0, 5),  // FB high (if double)
+          instr(MicrocodeOp.STORE, 3, 0, 0, 6),  // FC low
+          instr(MicrocodeOp.STORE, 3, 0, 0, 0)   // FC high (if double)
+        )
+
+        // Table 11.25: General Operations
+        case FpuOperation.ENTRY => base ++ Seq(instr(MicrocodeOp.FINALIZE, 0, 0, 0, 0))
+        case FpuOperation.REV => base ++ Seq(instr(MicrocodeOp.REV, 1, 2, 0, 0))
+        case FpuOperation.DUP => base ++ Seq(instr(MicrocodeOp.DUP, 1, 0, 0, 0))
+
+        // Table 11.26: Rounding Operations
+        case FpuOperation.RN => base ++ Seq(instr(MicrocodeOp.SETROUND, 1, 0, 0, 0))
+        case FpuOperation.RZ => base ++ Seq(instr(MicrocodeOp.SETROUND, 0, 0, 0, 0))
+        case FpuOperation.RP => base ++ Seq(instr(MicrocodeOp.SETROUND, 2, 0, 0, 0))
+        case FpuOperation.RM => base ++ Seq(instr(MicrocodeOp.SETROUND, 3, 0, 0, 0))
+
+        // Table 11.27: Error Operations
+        case FpuOperation.CHKERR => base ++ Seq(instr(MicrocodeOp.CHECKERR, 0, 0, 0, 0))
+        case FpuOperation.TESTERR => base ++ Seq(instr(MicrocodeOp.TESTERR, 0, 0, 0, 0))
+        case FpuOperation.SETERR => base ++ Seq(instr(MicrocodeOp.SETERR, 0, 0, 0, 0))
+        case FpuOperation.CLRERR => base ++ Seq(instr(MicrocodeOp.CLRERR, 0, 0, 0, 0))
+
+        // Table 11.28: Comparison Operations
+        case FpuOperation.GT => base ++ Seq(instr(MicrocodeOp.CMPGT, 1, 2, 4, 0))
+        case FpuOperation.EQ => base ++ Seq(instr(MicrocodeOp.CMPEQ, 1, 2, 4, 0))
+        case FpuOperation.ORDERED => base ++ Seq(instr(MicrocodeOp.CMPORDER, 1, 2, 4, 0))
+        case FpuOperation.NAN => base ++ Seq(instr(MicrocodeOp.CMPNAN, 1, 0, 4, 0))
+        case FpuOperation.NOTFINITE => base ++ Seq(instr(MicrocodeOp.CMPNOTFINITE, 1, 0, 4, 0))
+        case FpuOperation.CHKI32 => base ++ Seq(instr(MicrocodeOp.CHKI, 1, 0, 4, 0))
+        case FpuOperation.CHKI64 => base ++ Seq(instr(MicrocodeOp.CHKI, 1, 0, 4, 0))
+
+        // Table 11.29: Conversion Operations
+        case FpuOperation.R32TOR64 => base ++ Seq(instr(MicrocodeOp.R32TOR64, 1, 0, 1, 0))
+        case FpuOperation.R64TOR32 => base ++ Seq(
+          instr(MicrocodeOp.R64TOR32, 1, 0, 1, 2),
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
+        )
+        case FpuOperation.RTOI32 => base ++ Seq(instr(MicrocodeOp.CONVERT, 1, 0, 1, 0))
+        case FpuOperation.I32TOR32 => base ++ Seq(instr(MicrocodeOp.CONVERT, 1, 0, 1, 0))
+        case FpuOperation.I32TOR64 => base ++ Seq(instr(MicrocodeOp.CONVERT, 1, 0, 1, 0))
+        case FpuOperation.B32TOR64 => base ++ Seq(instr(MicrocodeOp.CONVERT, 1, 0, 1, 0))
+        case FpuOperation.NOROUND => base ++ Seq(instr(MicrocodeOp.NOROUND, 1, 0, 1, 0))
+        case FpuOperation.INT => base ++ Seq(instr(MicrocodeOp.INTOP, 1, 0, 1, 0))
+
+        // Table 11.30: Arithmetic Operations
+        case FpuOperation.ADD => base ++ Seq(
+          instr(MicrocodeOp.ADD, 1, 2, 1, 2),
+          instr(MicrocodeOp.NORM, 1, 0, 1, 3),
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
+        )
+        case FpuOperation.SUB => base ++ Seq(
+          instr(MicrocodeOp.SUB, 2, 1, 1, 2),
+          instr(MicrocodeOp.NORM, 1, 0, 1, 3),
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
+        )
+        case FpuOperation.MUL => base ++ Seq(
+          instr(MicrocodeOp.MUL, 1, 2, 1, 2),
+          instr(MicrocodeOp.NORM, 1, 0, 1, 3),
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
+        )
+        case FpuOperation.DIV => base ++ Seq(
+          instr(MicrocodeOp.DIV, 1, 2, 1, 2),  // 13 iterations in MICROCODE
+          instr(MicrocodeOp.NORM, 1, 0, 1, 3), // 14th iteration in NORMALIZE
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0) // 15th iteration and rounding in ROUND
+        )
+        case FpuOperation.ABS => base ++ Seq(instr(MicrocodeOp.ABS, 1, 0, 1, 0))
+        case FpuOperation.EXPINC32 => base ++ Seq(instr(MicrocodeOp.EXPINC32, 1, 0, 1, 0))
+        case FpuOperation.EXPDEC32 => base ++ Seq(instr(MicrocodeOp.EXPDEC32, 1, 0, 1, 0))
+        case FpuOperation.MULBY2 => base ++ Seq(instr(MicrocodeOp.MULBY2, 1, 0, 1, 0))
+        case FpuOperation.DIVBY2 => base ++ Seq(instr(MicrocodeOp.DIVBY2, 1, 0, 1, 0))
+
+        // Table 11.31: Compatibility Operations (Simplified)
+        case FpuOperation.SQRTFIRST => base ++ Seq(instr(MicrocodeOp.SQRT, 1, 0, 1, 0))
+        case FpuOperation.SQRTSTEP => base ++ Seq(instr(MicrocodeOp.SQRT, 1, 0, 1, 0))
+        case FpuOperation.SQRTLAST => base ++ Seq(instr(MicrocodeOp.SQRT, 1, 0, 1, 0))
+        case FpuOperation.REMFIRST => base ++ Seq(instr(MicrocodeOp.REM, 1, 2, 1, 0))
+        case FpuOperation.REMSTEP => base ++ Seq(instr(MicrocodeOp.REM, 1, 2, 1, 0))
+
+        // Table 11.32: Additional Operations
+        case FpuOperation.REM => base ++ Seq(
+          instr(MicrocodeOp.REM, 1, 2, 1, 2),
+          instr(MicrocodeOp.NORM, 1, 0, 1, 3),
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0)
+        )
+        case FpuOperation.SQRT => base ++ Seq(
+          instr(MicrocodeOp.SQRT, 1, 0, 1, 2), // 13 iterations in MICROCODE
+          instr(MicrocodeOp.NORM, 1, 0, 1, 3), // 14th iteration in NORMALIZE
+          instr(MicrocodeOp.ROUND, 1, 0, 1, 0) // 15th iteration and rounding in ROUND
+        )
+        case FpuOperation.RANGE => base ++ Seq(instr(MicrocodeOp.FINALIZE, 0, 0, 0, 0))
+        case FpuOperation.GE => base ++ Seq(instr(MicrocodeOp.CMPGT, 1, 2, 4, 0))
+        case FpuOperation.LG => base ++ Seq(instr(MicrocodeOp.CMPGT, 2, 1, 4, 0))
+
+        case _ => base ++ Seq(instr(MicrocodeOp.FINALIZE, 0, 0, 0, 0))
+      }
+    }
+  }
+}
+
+// Top-Level FPU with Retimed Pipeline
+class T9000Fpu(config: FPUConfig) extends PluginHost {
   val io = new Bundle {
-    val cmd       = slave Stream(FpuOp())
-    val memAddr   = out UInt(32 bits)
-    val memDataIn = in Bits(64 bits)
-    val memDataOut= out Bits(64 bits)
-    val memWrite  = out Bool()
-    val result    = master Flow(Bits(64 bits))
-    val flags     = out(FpuFlags())
-    val trap      = out Bool()
+    val inputA, inputB, inputC = in Bits(config.totalWidth bits)
+    val operation = in(FpuOperation())
+    val memAddress = in UInt(32 bits)
+    val result = out Bits(config.totalWidth bits)
+    val ready = out Bool()
+    val specialResult = out Bits(config.totalWidth bits)
   }
 
-  val fetch   = CtrlLink()
-  val decode  = CtrlLink()
-  val execute = CtrlLink()
-  val f2d     = StageLink(fetch.down, decode.up)
-  val d2e     = StageLink(decode.down, execute.up)
+  val status = Reg(new FPUStatus()).init(FPUStatus().clearAll())
+  val stackPlugin = addService(new FPUStackPlugin(config))
+  val vcuPlugin = addService(new VCUPlugin(config))
+  val adderSubPlugin = addService(new AdderSubtractorPlugin(config))
+  val multiplierPlugin = addService(new MultiplierPlugin(config))
+  val dividerSqrtPlugin = addService(new DividerSqrtPlugin(config))
+  val microRomPlugin = addService(new MicrocodeROMPlugin(config))
 
-  val OPCODE    = Payload(FpuOp())
-  val MICROCODE = Payload(Microcode())
-  val STEP      = Payload(UInt(4 bits))
+  val logic = during build { new Area {
+    val mem = Mem(Bits(32 bits), 1024)
+    val pipeline = new StageCtrlPipeline()
+    pipeline.build()
 
-  val stack  = Vec.fill(3)(Reg(Fp64()) init { val temp = Fp64(); temp.assignFromBits(0); temp })  // Updated init
-  val status = Reg(FpStatus()) init FpStatus(B"01", B"00", B"00", B"00")
-  val microcode = MicrocodeRom()
-
-  val fetcher = new fetch.Area {
-    io.cmd.ready := False
-    when(io.cmd.valid) {
-      OPCODE := io.cmd.payload
-      STEP := 0
-      io.cmd.ready := True
-    }
-  }
-
-  val decoder = new decode.Area {
-    MICROCODE := microcode(OPCODE.asBits.asUInt)
-    io.memAddr := 0
-    io.memWrite := False
-  }
-
-  val executor = new execute.Area {
-    val micro = MICROCODE
-    val step = STEP
-    val resultReg = Reg(Fp64()) init { val temp = Fp64(); temp.assignFromBits(0); temp }  // Updated init
-    val flagsReg = Reg(FpuFlags()) init { val temp = FpuFlags(); temp.assignFromBits(0); temp }  // Updated init
-
-    val adder = new DualAdder
-    val mul = new Multiplier
-    val divRoot = new DividerRooter
-    val vcu = new VCU
-
-    val isSingle = status.fpaType === B"00" && status.fpbType === B"00"
-    val effectiveOp = micro.op.mux(
-      FpuOp.FPADD_S      -> Mux(isSingle, FpuOp.FPADD_S, FpuOp.FPADD_D),
-      FpuOp.FPADD_D      -> Mux(isSingle, FpuOp.FPADD_S, FpuOp.FPADD_D),
-      FpuOp.FPSUB_S      -> Mux(isSingle, FpuOp.FPSUB_S, FpuOp.FPSUB_D),
-      FpuOp.FPSUB_D      -> Mux(isSingle, FpuOp.FPSUB_S, FpuOp.FPSUB_D),
-      FpuOp.FPMUL_S      -> Mux(isSingle, FpuOp.FPMUL_S, FpuOp.FPMUL_D),
-      FpuOp.FPMUL_D      -> Mux(isSingle, FpuOp.FPMUL_S, FpuOp.FPMUL_D),
-      FpuOp.FPDIV_S      -> Mux(isSingle, FpuOp.FPDIV_S, FpuOp.FPDIV_D),
-      FpuOp.FPDIV_D      -> Mux(isSingle, FpuOp.FPDIV_S, FpuOp.FPDIV_D),
-      FpuOp.FPABS_S      -> Mux(isSingle, FpuOp.FPABS_S, FpuOp.FPABS_D),
-      FpuOp.FPABS_D      -> Mux(isSingle, FpuOp.FPABS_S, FpuOp.FPABS_D),
-      FpuOp.FPMULBY2_S   -> Mux(isSingle, FpuOp.FPMULBY2_S, FpuOp.FPMULBY2_D),
-      FpuOp.FPMULBY2_D   -> Mux(isSingle, FpuOp.FPMULBY2_S, FpuOp.FPMULBY2_D),
-      FpuOp.FPDIVBY2_S   -> Mux(isSingle, FpuOp.FPDIVBY2_S, FpuOp.FPDIVBY2_D),
-      FpuOp.FPDIVBY2_D   -> Mux(isSingle, FpuOp.FPDIVBY2_S, FpuOp.FPDIVBY2_D),
-      FpuOp.FPSQRT_S     -> Mux(isSingle, FpuOp.FPSQRT_S, FpuOp.FPSQRT_D),
-      FpuOp.FPSQRT_D     -> Mux(isSingle, FpuOp.FPSQRT_S, FpuOp.FPSQRT_D),
-      FpuOp.FPREM_S      -> Mux(isSingle, FpuOp.FPREM_S, FpuOp.FPREM_D),
-      FpuOp.FPREM_D      -> Mux(isSingle, FpuOp.FPREM_S, FpuOp.FPREM_D),
-      FpuOp.FPUSQRTLAST_S -> Mux(isSingle, FpuOp.FPUSQRTLAST_S, FpuOp.FPUSQRTLAST_D),
-      FpuOp.FPUSQRTLAST_D -> Mux(isSingle, FpuOp.FPUSQRTLAST_S, FpuOp.FPUSQRTLAST_D),
-      FpuOp.FPRANGE_S    -> Mux(isSingle, FpuOp.FPRANGE_S, FpuOp.FPRANGE_D),
-      FpuOp.FPRANGE_D    -> Mux(isSingle, FpuOp.FPRANGE_S, FpuOp.FPRANGE_D),
-      FpuOp.FPGT_S       -> Mux(isSingle, FpuOp.FPGT_S, FpuOp.FPGT_D),
-      FpuOp.FPGT_D       -> Mux(isSingle, FpuOp.FPGT_S, FpuOp.FPGT_D),
-      FpuOp.FPEQ_S       -> Mux(isSingle, FpuOp.FPEQ_S, FpuOp.FPEQ_D),
-      FpuOp.FPEQ_D       -> Mux(isSingle, FpuOp.FPEQ_S, FpuOp.FPEQ_D),
-      FpuOp.FPORDERED_S  -> Mux(isSingle, FpuOp.FPORDERED_S, FpuOp.FPORDERED_D),
-      FpuOp.FPORDERED_D  -> Mux(isSingle, FpuOp.FPORDERED_S, FpuOp.FPORDERED_D),
-      FpuOp.FPGE_S       -> Mux(isSingle, FpuOp.FPGE_S, FpuOp.FPGE_D),
-      FpuOp.FPGE_D       -> Mux(isSingle, FpuOp.FPGE_S, FpuOp.FPGE_D),
-      FpuOp.FPLG_S       -> Mux(isSingle, FpuOp.FPLG_S, FpuOp.FPLG_D),
-      FpuOp.FPLG_D       -> Mux(isSingle, FpuOp.FPLG_S, FpuOp.FPLG_D),
-      default            -> micro.op
-    )
-    val effectiveMicro = microcode(effectiveOp.asBits.asUInt)
-    val effectiveStepCount = effectiveMicro.stepCount
-
-    adder.io.a := stack(0)
-    adder.io.b := stack(1)
-    adder.io.isSub := effectiveMicro.op === FpuOp.FPSUB_S || effectiveMicro.op === FpuOp.FPSUB_D
-    adder.io.roundingMode := status.toRoundingMode
-    adder.io.isSingle := isSingle
-    mul.io.a := stack(0)
-    mul.io.b := stack(1)
-    mul.io.roundingMode := status.toRoundingMode
-    mul.io.isSingle := isSingle
-    divRoot.io.a := stack(0)
-    divRoot.io.b := stack(1)
-    divRoot.io.isDiv := effectiveMicro.op === FpuOp.FPDIV_S || effectiveMicro.op === FpuOp.FPDIV_D
-    divRoot.io.roundingMode := status.toRoundingMode
-    divRoot.io.isSingle := isSingle
-    vcu.io.a := stack(0)
-    vcu.io.b := stack(1)
-    vcu.io.op := effectiveMicro.op
-    vcu.io.isSingle := isSingle
-
-    io.trap := effectiveMicro.trapEnable && (flagsReg.NV || flagsReg.DZ || flagsReg.OF || flagsReg.UF || flagsReg.NX)
-    when(io.trap) {
-      resultReg := stack(0)
+    val FETCH = new pipeline.Ctrl(0) {
+      val PAYLOAD = insert(FpuPayload(config))
+      PAYLOAD.FA := stackPlugin.logic.stack(0).fromBits(io.inputA)
+      PAYLOAD.FB := stackPlugin.logic.stack(1).fromBits(io.inputB)
+      PAYLOAD.FC := stackPlugin.logic.stack(2).fromBits(io.inputC)
+      PAYLOAD.opcode := io.operation
+      PAYLOAD.microPc := 0
+      PAYLOAD.status := status
     }
 
-    when(isValid && step < effectiveStepCount) {
-      val doNorm = vcu.io.needsNorm && step === 0
-      val doBypass = vcu.io.bypass && !doNorm
-
-      when(doNorm) {
-        when(stack(0).isDenorm) {
-          val shift = CountOne(stack(0).mant.asUInt).resize(6)
-          stack(0).exp := stack(0).exp - shift
-          stack(0).mant := (stack(0).mant << shift)(51 downto 0)
-        }
-        when(stack(1).isDenorm) {
-          val shift = CountOne(stack(1).mant.asUInt).resize(6)
-          stack(1).exp := stack(1).exp - shift
-          stack(1).mant := (stack(1).mant << shift)(51 downto 0)
-        }
+    val DECODE = new pipeline.Ctrl(1) {
+      vcuPlugin.logic.io.operandA := FETCH.PAYLOAD.FA
+      vcuPlugin.logic.io.operandB := FETCH.PAYLOAD.FB
+      vcuPlugin.logic.io.opcode := FETCH.PAYLOAD.opcode
+      when(vcuPlugin.logic.io.abort) {
+        FETCH.PAYLOAD.result := vcuPlugin.logic.io.result
+        FETCH.PAYLOAD.status := vcuPlugin.logic.io.status
+        throwIt()
       }
-
-      resultReg := Mux(doBypass, vcu.io.result, resultReg)
-      flagsReg := Mux(doBypass, vcu.io.flags, flagsReg)
-
-      when(!doNorm && !doBypass) {
-        switch(effectiveMicro.op) {
-          is(FpuOp.FPLDNLSN) {
-            val fp32Temp = Fp32()
-            fp32Temp.assignFromBits(io.memDataIn(31 downto 0))
-            resultReg := fp32Temp.toFp64
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPLDNLDB) {
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(io.memDataIn)
-            resultReg := fp64Temp
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPLDNLSNI) {
-            val fp32Temp = Fp32()
-            fp32Temp.assignFromBits(io.memDataIn(31 downto 0))
-            resultReg := fp32Temp.toFp64
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPLDNLDBI) {
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(io.memDataIn)
-            resultReg := fp64Temp
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPLDZEROSN) {
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(0)
-            resultReg := fp64Temp
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPLDZERODB) {
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(0)
-            resultReg := fp64Temp
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPLDNLADDSN) {
-            when(step === 0) {
-              val fp32Temp = Fp32()
-              fp32Temp.assignFromBits(io.memDataIn(31 downto 0))
-              resultReg := fp32Temp.toFp64
-            }.otherwise {
-              adder.io.a := resultReg
-              resultReg := adder.io.result
-              flagsReg := adder.io.flags
-            }
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPLDNLADDDB) {
-            when(step === 0) {
-              val fp64Temp = Fp64()
-              fp64Temp.assignFromBits(io.memDataIn)
-              resultReg := fp64Temp
-            }.otherwise {
-              adder.io.a := resultReg
-              resultReg := adder.io.result
-              flagsReg := adder.io.flags
-            }
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPLDNLMULSN) {
-            when(step === 0) {
-              val fp32Temp = Fp32()
-              fp32Temp.assignFromBits(io.memDataIn(31 downto 0))
-              resultReg := fp32Temp.toFp64
-            }.otherwise {
-              mul.io.a := resultReg
-              resultReg := mul.io.result
-              flagsReg := mul.io.flags
-            }
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPLDNLMULDB) {
-            when(step === 0) {
-              val fp64Temp = Fp64()
-              fp64Temp.assignFromBits(io.memDataIn)
-              resultReg := fp64Temp
-            }.otherwise {
-              mul.io.a := resultReg
-              resultReg := mul.io.result
-              flagsReg := mul.io.flags
-            }
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPSTNLSN) {
-            io.memDataOut := stack(0).toFp32.asBits.resize(64)
-            io.memWrite := True
-          }
-          is(FpuOp.FPSTNLDB) {
-            io.memDataOut := stack(0).asBits
-            io.memWrite := True
-          }
-          is(FpuOp.FPSTNLI32) {
-            io.memDataOut := stack(0).mant(31 downto 0).asSInt.asBits.resize(64)
-            io.memWrite := True
-          }
-          is(FpuOp.FPENTRY) {
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(io.memDataIn)
-            resultReg := fp64Temp
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPREV) {
-            val temp = stack(0)
-            stack(0) := stack(1)
-            stack(1) := temp
-            val tempType = status.fpaType
-            status.fpaType := status.fpbType
-            status.fpbType := tempType
-          }
-          is(FpuOp.FPDUP) {
-            resultReg := stack(0)
-          }
-          is(FpuOp.FPRN) {
-            status.roundingMode := B"01"
-          }
-          is(FpuOp.FPRZ) {
-            status.roundingMode := B"00"
-          }
-          is(FpuOp.FPRP) {
-            status.roundingMode := B"10"
-          }
-          is(FpuOp.FPRM) {
-            status.roundingMode := B"11"
-          }
-          is(FpuOp.FPCHKERR) {
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(Cat(flagsReg.asBits.resize(52), U"0".resize(11), flagsReg.NV))
-            resultReg := fp64Temp
-          }
-          is(FpuOp.FPTESTERR) {
-            flagsReg.NV := False
-            flagsReg.NX := False
-            flagsReg.OF := False
-            flagsReg.UF := False
-            flagsReg.DZ := False
-          }
-          is(FpuOp.FPSETERR) {
-            flagsReg.NV := True
-          }
-          is(FpuOp.FPCLRERR) {
-            flagsReg.NV := False
-            flagsReg.NX := False
-            flagsReg.OF := False
-            flagsReg.UF := False
-            flagsReg.DZ := False
-          }
-          is(FpuOp.FPGT_S, FpuOp.FPGT_D) {
-            adder.io.isSub := True
-            val diff = adder.io.result
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(Cat(diff.sign, U"0".resize(11), B"0".resize(52)))
-            resultReg := fp64Temp
-            flagsReg := adder.io.flags
-          }
-          is(FpuOp.FPEQ_S, FpuOp.FPEQ_D) {
-            adder.io.isSub := True
-            val diff = adder.io.result
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(Cat(~diff.isZero, U"0".resize(11), B"0".resize(52)))
-            resultReg := fp64Temp
-            flagsReg := adder.io.flags
-          }
-          is(FpuOp.FPORDERED_S, FpuOp.FPORDERED_D) {
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(Cat(~(stack(0).isNaN || stack(1).isNaN), U"0".resize(11), B"0".resize(52)))
-            resultReg := fp64Temp
-          }
-          is(FpuOp.FPNAN) {
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(Cat(stack(0).isNaN, U"0".resize(11), B"0".resize(52)))
-            resultReg := fp64Temp
-          }
-          is(FpuOp.FPNOTFINITE) {
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(Cat(stack(0).isInf || stack(0).isNaN, U"0".resize(11), B"0".resize(52)))
-            resultReg := fp64Temp
-          }
-          is(FpuOp.FPCHKI32) {
-            when(step === 0) {
-              resultReg := stack(0)
-            }.otherwise {
-              val intVal = resultReg.mant(31 downto 0).asSInt
-              flagsReg.OF := resultReg.exp > 31
-              val fp64Temp = Fp64()
-              fp64Temp.assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
-              resultReg := fp64Temp
-            }
-          }
-          is(FpuOp.FPCHKI64) {
-            when(step === 0) {
-              resultReg := stack(0)
-            }.otherwise {
-              val intVal = resultReg.mant.asSInt
-              flagsReg.OF := resultReg.exp > 63
-              val fp64Temp = Fp64()
-              fp64Temp.assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
-              resultReg := fp64Temp
-            }
-          }
-          is(FpuOp.FPR321OR64) {
-            when(step === 0) {
-              resultReg := stack(0)
-            }.otherwise {
-              resultReg := resultReg.toFp32.toFp64
-              flagsReg.NX := stack(0).mant(28 downto 0) =/= 0
-            }
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPR64TOR32) {
-            when(step === 0) {
-              resultReg := stack(0)
-            }.otherwise {
-              resultReg := resultReg.toFp32.toFp64
-              flagsReg.NX := stack(0).mant(28 downto 0) =/= 0
-            }
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPRTOI32) {
-            when(step === 0) {
-              resultReg := stack(0)
-            }.otherwise {
-              val intVal = resultReg.mant(31 downto 0).asSInt
-              flagsReg.OF := resultReg.exp > 31
-              val fp64Temp = Fp64()
-              fp64Temp.assignFromBits(Cat(intVal < 0, U"0".resize(11), intVal.abs.asBits.resize(52)))
-              resultReg := fp64Temp
-            }
-          }
-          is(FpuOp.FPI321OR32) {
-            when(step === 0) {
-              val fp64Temp = Fp64()
-              fp64Temp.assignFromBits(Cat(stack(0).sign, U(127 + 31), stack(0).mant))
-              resultReg := fp64Temp
-            }.otherwise {
-              resultReg := resultReg.toFp32.toFp64
-              flagsReg.NX := stack(0).mant(28 downto 0) =/= 0
-            }
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPI321OR64) {
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(Cat(stack(0).sign, U(1023 + 31), stack(0).mant))
-            resultReg := fp64Temp
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPB321OR64) {
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(stack(0).asBits)
-            resultReg := fp64Temp
-            status.fpaType := B"01"
-          }
-          is(FpuOp.FPNOROUND) {
-            when(step === 0) {
-              resultReg := stack(0)
-            }.otherwise {
-              val fp64Temp = Fp64()
-              fp64Temp.assignFromBits(Cat(stack(0).sign, stack(0).exp(7 downto 0).resize(11), stack(0).mant(51 downto 29) << 29))
-              resultReg := fp64Temp
-            }
-            status.fpaType := B"00"
-          }
-          is(FpuOp.FPINT) {
-            when(step === 0) {
-              resultReg := stack(0)
-            }.otherwise {
-              val shift = S(52) - resultReg.exp.asSInt
-              when(shift < 0) {
-                resultReg.mant := resultReg.mant << shift.abs
-              }.otherwise {
-                resultReg.mant := resultReg.mant >> shift.asUInt
-              }
-              resultReg.exp := U(0, 11 bits)
-            }
-          }
-          is(FpuOp.FPADD_S, FpuOp.FPADD_D) {
-            resultReg := adder.io.result
-            flagsReg := adder.io.flags
-          }
-          is(FpuOp.FPSUB_S, FpuOp.FPSUB_D) {
-            resultReg := adder.io.result
-            flagsReg := adder.io.flags
-          }
-          is(FpuOp.FPMUL_S, FpuOp.FPMUL_D) {
-            resultReg := mul.io.result
-            flagsReg := mul.io.flags
-          }
-          is(FpuOp.FPDIV_S, FpuOp.FPDIV_D) {
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPABS_S, FpuOp.FPABS_D) {
-            resultReg := stack(0)
-            resultReg.sign := False
-          }
-          is(FpuOp.FPEXPINC32) {
-            resultReg := stack(0)
-            resultReg.exp := stack(0).exp + 32
-            flagsReg.OF := resultReg.exp > 254
-          }
-          is(FpuOp.FPEXPDEC32) {
-            resultReg := stack(0)
-            resultReg.exp := stack(0).exp - 32
-            flagsReg.UF := resultReg.exp < 1
-          }
-          is(FpuOp.FPMULBY2_S, FpuOp.FPMULBY2_D) {
-            resultReg := stack(0)
-            resultReg.exp := stack(0).exp + 1
-            flagsReg.OF := resultReg.exp > Mux(isSingle, U(254), U(2046))
-          }
-          is(FpuOp.FPDIVBY2_S, FpuOp.FPDIVBY2_D) {
-            resultReg := stack(0)
-            resultReg.exp := stack(0).exp - 1
-            flagsReg.UF := resultReg.exp < 1
-          }
-          is(FpuOp.FPUSQRTFIRST) {
-            divRoot.io.isDiv := False
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPUSQRTSTEP) {
-            divRoot.io.isDiv := False
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPUSQRTLAST_S, FpuOp.FPUSQRTLAST_D) {
-            divRoot.io.isDiv := False
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPREMFIRST) {
-            divRoot.io.isDiv := True
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPREMSTEP) {
-            divRoot.io.isDiv := True
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPREM_S, FpuOp.FPREM_D) {
-            divRoot.io.isDiv := True
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPSQRT_S, FpuOp.FPSQRT_D) {
-            divRoot.io.isDiv := False
-            resultReg := divRoot.io.result
-            flagsReg := divRoot.io.flags
-          }
-          is(FpuOp.FPRANGE_S, FpuOp.FPRANGE_D) {
-            when(step === 0) {
-              resultReg := stack(0)
-            } otherwise {
-              when(step === 1) {
-                resultReg := Mux(resultReg.exp > Mux(isSingle, U(254), U(2046)),
-                  { val temp = Fp64(); temp.assignFromBits(Cat(resultReg.sign, Mux(isSingle, U(254, 11 bits), U(2046)), B"0".resize(52))); temp },
-                  resultReg)
-                flagsReg.OF := resultReg.exp > Mux(isSingle, U(254), U(2046))
-              } otherwise {
-                when(step === 2) {
-                  resultReg := Mux(resultReg.exp < 1,
-                    { val temp = Fp64(); temp.assignFromBits(Cat(resultReg.sign, U(1, 11 bits), B"0".resize(52))); temp },
-                    resultReg)
-                  flagsReg.UF := resultReg.exp < 1
-                }
-              }
-            }
-          }
-          is(FpuOp.FPGE_S, FpuOp.FPGE_D) {
-            adder.io.isSub := True
-            val diff = adder.io.result
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(Cat(~(diff.sign || diff.isZero), U"0".resize(11), B"0".resize(52)))
-            resultReg := fp64Temp
-            flagsReg := adder.io.flags
-          }
-          is(FpuOp.FPLG_S, FpuOp.FPLG_D) {
-            adder.io.isSub := True
-            val diff = adder.io.result
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(Cat(diff.sign && !diff.isZero, U"0".resize(11), B"0".resize(52)))
-            resultReg := fp64Temp
-            flagsReg := adder.io.flags
-          }
-          is(FpuOp.FPSTALL) {
-            io.memDataOut := stack(0).asBits
-            io.memWrite := True
-          }
-          is(FpuOp.FPLDALL) {
-            val fp64Temp = Fp64()
-            fp64Temp.assignFromBits(io.memDataIn)
-            resultReg := fp64Temp
-            status := FpStatus.assignFromBits(io.memDataIn(31 downto 0))
-          }
-        }
-      }
-
-      when(effectiveMicro.pushStack) {
-        stack(2) := stack(1)
-        stack(1) := stack(0)
-        stack(0) := resultReg
-        status.fpcType := status.fpbType
-        status.fpbType := status.fpaType
-        status.fpaType := Mux(isSingle, B"00", B"01")
-      }
-      when(effectiveMicro.popStack) {
-        stack(0) := stack(1)
-        stack(1) := stack(2)
-        val temp = Fp64()
-        temp.assignFromBits(0)
-        stack(2) := temp
-        status.fpaType := status.fpbType
-        status.fpbType := status.fpcType
-        status.fpcType := B"00"
-      }
-      STEP := step + 1
     }
 
-    io.result.valid := isValid && step === effectiveStepCount
-    io.result.payload := resultReg.asBits
-    io.flags := flagsReg
-    status.roundingMode := B"01" // Reset to RNE per ISM 11.12
-  }
+    val MICROCODE = new pipeline.Ctrl(2) {
+      microRomPlugin.logic.io.operation := FETCH.PAYLOAD.opcode
+      microRomPlugin.logic.io.address := FETCH.PAYLOAD.microPc
+      val microInst = microRomPlugin.logic.io.instruction
 
-  Builder(fetch, decode, execute, f2d, d2e)
+      FETCH.PAYLOAD.status.unalign := io.memAddress(1 downto 0) =/= 0
+
+      dividerSqrtPlugin.logic.io.dividend := FETCH.PAYLOAD.FA
+      dividerSqrtPlugin.logic.io.divisor := FETCH.PAYLOAD.FB
+      dividerSqrtPlugin.logic.io.isSquareRoot := FETCH.PAYLOAD.opcode === FpuOperation.SQRT
+      dividerSqrtPlugin.logic.io.status := FETCH.PAYLOAD.status
+      dividerSqrtPlugin.logic.io.finalize := False
+      dividerSqrtPlugin.logic.io.partialRemainderIn := 0
+      dividerSqrtPlugin.logic.io.quotientIn := 0
+      dividerSqrtPlugin.logic.io.counterIn := 0
+
+      switch(microInst.op) {
+        is(MicrocodeOp.LOAD) {
+          when(FETCH.PAYLOAD.opcode === FpuOperation.LDLNSN || FETCH.PAYLOAD.opcode === FpuOperation.LDNLSNI) {
+            FETCH.PAYLOAD.FA := FloatData(config).fromBits(mem.readSync(io.memAddress).resize(32))
+            stackPlugin.logic.push(FETCH.PAYLOAD.FA, 0)
+          }
+          when(FETCH.PAYLOAD.opcode === FpuOperation.LDNLDB || FETCH.PAYLOAD.opcode === FpuOperation.LDNLDBI) {
+            FETCH.PAYLOAD.FA := FloatData(config).fromBits(Cat(mem.readSync(io.memAddress + 1), mem.readSync(io.memAddress)))
+            stackPlugin.logic.push(FETCH.PAYLOAD.FA, 1)
+          }
+          when(FETCH.PAYLOAD.opcode === FpuOperation.LDZEROSN) {
+            FETCH.PAYLOAD.FA := FloatData(config).fromBits(B"0".resize(32))
+            stackPlugin.logic.push(FETCH.PAYLOAD.FA, 0)
+          }
+          when(FETCH.PAYLOAD.opcode === FpuOperation.LDZERODB) {
+            FETCH.PAYLOAD.FA := FloatData(config).fromBits(B"0".resize(64))
+            stackPlugin.logic.push(FETCH.PAYLOAD.FA, 1)
+          }
+          when(FETCH.PAYLOAD.opcode === FpuOperation.LDNLADDSN || FETCH.PAYLOAD.opcode === FpuOperation.LDNLMULSN) {
+            FETCH.PAYLOAD.tempA := FloatData(config).fromBits(mem.readSync(io.memAddress).resize(32))
+          }
+          when(FETCH.PAYLOAD.opcode === FpuOperation.LDNLADDDB || FETCH.PAYLOAD.opcode === FpuOperation.LDNLMULDB) {
+            FETCH.PAYLOAD.tempA := FloatData(config).fromBits(Cat(mem.readSync(io.memAddress + 1), mem.readSync(io.memAddress)))
+          }
+        }
+        is(MicrocodeOp.STORE) {
+          when(FETCH.PAYLOAD.opcode === FpuOperation.STALL) {
+            switch(FETCH.PAYLOAD.microPc) {
+              is(1) { mem.write(io.memAddress, Cat(FETCH.PAYLOAD.status.reserved, FETCH.PAYLOAD.status.typeFPCreg, FETCH.PAYLOAD.status.typeFPBreg, FETCH.PAYLOAD.status.typeFPAreg, FETCH.PAYLOAD.status.roundingMode)) }
+              is(2) { mem.write(io.memAddress + 1, FETCH.PAYLOAD.FA.asBits(31 downto 0)) }
+              is(3) { when(FETCH.PAYLOAD.status.typeFPAreg === 1) { mem.write(io.memAddress + 2, FETCH.PAYLOAD.FA.asBits(63 downto 32)) } }
+              is(4) { mem.write(io.memAddress + (if (FETCH.PAYLOAD.status.typeFPAreg === 0) 2 else 3), FETCH.PAYLOAD.FB.asBits(31 downto 0)) }
+              is(5) { when(FETCH.PAYLOAD.status.typeFPBreg === 1) { mem.write(io.memAddress + (if (FETCH.PAYLOAD.status.typeFPAreg === 0) 3 else 4), FETCH.PAYLOAD.FB.asBits(63 downto 32)) } }
+              is(6) { mem.write(io.memAddress + (if (FETCH.PAYLOAD.status.typeFPAreg === 0 && FETCH.PAYLOAD.status.typeFPBreg === 0) 3 else if (FETCH.PAYLOAD.status.typeFPAreg === 1 && FETCH.PAYLOAD.status.typeFPBreg === 1) 5 else 4), FETCH.PAYLOAD.FC.asBits(31 downto 0)) }
+              is(0) { when(FETCH.PAYLOAD.status.typeFPCreg === 1) { mem.write(io.memAddress + (if (FETCH.PAYLOAD.status.typeFPAreg === 0 && FETCH.PAYLOAD.status.typeFPBreg === 0) 4 else if (FETCH.PAYLOAD.status.typeFPAreg === 1 && FETCH.PAYLOAD.status.typeFPBreg === 1) 6 else 5), FETCH.PAYLOAD.FC.asBits(63 downto 32)) } }
+            }
+          }
+          when(FETCH.PAYLOAD.opcode === FpuOperation.STNLDB) {
+            mem.write(io.memAddress, FETCH.PAYLOAD.FA.asBits(31 downto 0))
+            mem.write(io.memAddress + 1, FETCH.PAYLOAD.FA.asBits(63 downto 32))
+            stackPlugin.logic.pop()
+          }
+          when(FETCH.PAYLOAD.opcode === FpuOperation.STNLSN) {
+            mem.write(io.memAddress, FETCH.PAYLOAD.FA.asBits(31 downto 0))
+            stackPlugin.logic.pop()
+          }
+          when(FETCH.PAYLOAD.opcode === FpuOperation.STNLI32) {
+            mem.write(io.memAddress, FETCH.PAYLOAD.tempA.asBits(31 downto 0))
+            stackPlugin.logic.pop()
+          }
+        }
+        is(MicrocodeOp.ADD) {
+          adderSubPlugin.logic.io.opA := Mux(microInst.srcA === 1, FETCH.PAYLOAD.FA, FETCH.PAYLOAD.tempA)
+          adderSubPlugin.logic.io.opB := FETCH.PAYLOAD.FB
+          adderSubPlugin.logic.io.isSubtract := False
+          adderSubPlugin.logic.io.status := FETCH.PAYLOAD.status
+          FETCH.PAYLOAD.result := adderSubPlugin.logic.io.result
+          FETCH.PAYLOAD.status := adderSubPlugin.logic.io.outStatus
+        }
+        is(MicrocodeOp.SUB) {
+          adderSubPlugin.logic.io.opA := FETCH.PAYLOAD.FB
+          adderSubPlugin.logic.io.opB := FETCH.PAYLOAD.FA
+          adderSubPlugin.logic.io.isSubtract := True
+          adderSubPlugin.logic.io.status := FETCH.PAYLOAD.status
+          FETCH.PAYLOAD.result := adderSubPlugin.logic.io.result
+          FETCH.PAYLOAD.status := adderSubPlugin.logic.io.outStatus
+          stackPlugin.logic.pop()
+        }
+        is(MicrocodeOp.MUL) {
+          multiplierPlugin.logic.io.opA := Mux(microInst.srcA === 1, FETCH.PAYLOAD.FA, FETCH.PAYLOAD.tempA)
+          multiplierPlugin.logic.io.opB := FETCH.PAYLOAD.FB
+          multiplierPlugin.logic.io.status := FETCH.PAYLOAD.status
+          FETCH.PAYLOAD.result := multiplierPlugin.logic.io.result
+          FETCH.PAYLOAD.status := multiplierPlugin.logic.io.outStatus
+        }
+        is(MicrocodeOp.DIV, MicrocodeOp.SQRT) {
+          FETCH.PAYLOAD.result := dividerSqrtPlugin.logic.io.result
+          FETCH.PAYLOAD.status := dividerSqrtPlugin.logic.io.outStatus
+          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(dividerSqrtPlugin.logic.io.partialRemainderOut.asBits.resize(config.totalWidth))
+          FETCH.PAYLOAD.tempB := FETCH.PAYLOAD.FA.fromBits(dividerSqrtPlugin.logic.io.quotientOut.asBits.resize(config.totalWidth))
+        }
+        is(MicrocodeOp.CONVERT) {
+          when(FETCH.PAYLOAD.opcode === FpuOperation.STNLI32 || FETCH.PAYLOAD.opcode === FpuOperation.RTOI32) {
+            val mantissaShifted = S(FETCH.PAYLOAD.FA.normalizedMantissa) << (FETCH.PAYLOAD.FA.exponent.toSInt - config.bias)
+            val int64 = Mux(FETCH.PAYLOAD.FA.sign, -mantissaShifted, mantissaShifted)
+            FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(int64.asBits.resize(config.totalWidth))
+          }
+          when(FETCH.PAYLOAD.opcode === FpuOperation.I32TOR32 || FETCH.PAYLOAD.opcode === FpuOperation.I32TOR64) {
+            val int32 = S(FETCH.PAYLOAD.FA.asBits(31 downto 0))
+            val absInt32 = Mux(int32 < 0, -int32, int32)
+            val shift = countLeadingZeros(absInt32.asUInt)
+            FETCH.PAYLOAD.result.sign := int32 < 0
+            FETCH.PAYLOAD.result.exponent := U(31 - shift + config.bias, config.exponentWidth bits)
+            FETCH.PAYLOAD.result.mantissa := (absInt32.asUInt << shift)(config.mantissaWidth - 1 downto 0)
+          }
+          when(FETCH.PAYLOAD.opcode === FpuOperation.R32TOR64 || FETCH.PAYLOAD.opcode === FpuOperation.B32TOR64) {
+            FETCH.PAYLOAD.result := FloatData(config).fromBits(Cat(FETCH.PAYLOAD.FA.asBits(31 downto 0), B"0".resize(29)))
+          }
+        }
+        is(MicrocodeOp.DUP) {
+          stackPlugin.logic.push(FETCH.PAYLOAD.FA, FETCH.PAYLOAD.status.typeFPAreg)
+        }
+        is(MicrocodeOp.REV) {
+          val temp = FETCH.PAYLOAD.FA
+          FETCH.PAYLOAD.FA := FETCH.PAYLOAD.FB
+          FETCH.PAYLOAD.FB := temp
+          val tempType = FETCH.PAYLOAD.status.typeFPAreg
+          FETCH.PAYLOAD.status.typeFPAreg := FETCH.PAYLOAD.status.typeFPBreg
+          FETCH.PAYLOAD.status.typeFPBreg := tempType
+        }
+        is(MicrocodeOp.SETROUND) {
+          FETCH.PAYLOAD.status.roundingMode := microInst.srcA.asUInt
+        }
+        is(MicrocodeOp.CHECKERR) {
+          when(FETCH.PAYLOAD.status.invalid && FETCH.PAYLOAD.status.trapEnableInvalid) {
+            FETCH.PAYLOAD.status.invalid := True
+          }
+        }
+        is(MicrocodeOp.TESTERR) {
+          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(FETCH.PAYLOAD.status.invalid, 64 bits))
+          FETCH.PAYLOAD.status.invalid := False
+        }
+        is(MicrocodeOp.SETERR) {
+          FETCH.PAYLOAD.status.invalid := True
+        }
+        is(MicrocodeOp.CLRERR) {
+          FETCH.PAYLOAD.status.clearAll()
+        }
+        is(MicrocodeOp.CMPGT) {
+          val diff = adderSubPlugin.logic.io.opA.exponent - adderSubPlugin.logic.io.opB.exponent
+          val mantDiff = S(FETCH.PAYLOAD.FA.normalizedMantissa) - S(FETCH.PAYLOAD.FB.normalizedMantissa)
+          val gt = (FETCH.PAYLOAD.FA.sign === FETCH.PAYLOAD.FB.sign) ?
+                   (diff > 0 || (diff === 0 && mantDiff > 0)) |
+                   (FETCH.PAYLOAD.FA.sign === False && FETCH.PAYLOAD.FB.sign === True)
+          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(gt, 64 bits))
+        }
+        is(MicrocodeOp.CMPEQ) {
+          val eq = FETCH.PAYLOAD.FA.asBits === FETCH.PAYLOAD.FB.asBits
+          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(eq, 64 bits))
+        }
+        is(MicrocodeOp.CMPORDER) {
+          val ordered = !FETCH.PAYLOAD.FA.isNaN && !FETCH.PAYLOAD.FB.isNaN
+          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(ordered, 64 bits))
+        }
+        is(MicrocodeOp.CMPNAN) {
+          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(FETCH.PAYLOAD.FA.isNaN, 64 bits))
+        }
+        is(MicrocodeOp.CMPNOTFINITE) {
+          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(!FETCH.PAYLOAD.FA.isFinite, 64 bits))
+        }
+        is(MicrocodeOp.CHKI) {
+          val intVal = S(FETCH.PAYLOAD.FA.normalizedMantissa) << (FETCH.PAYLOAD.FA.exponent.toSInt - config.bias)
+          val inRange = if (FETCH.PAYLOAD.opcode === FpuOperation.CHKI32)
+                          intVal >= S(-2147483648) && intVal <= S(2147483647)
+                        else
+                          intVal >= S(-9223372036854775808L) && intVal <= S(9223372036854775807L)
+          FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(B(inRange, 64 bits))
+        }
+        is(MicrocodeOp.ABS) {
+          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA
+          FETCH.PAYLOAD.result.sign := False
+        }
+        is(MicrocodeOp.EXPINC32) {
+          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA
+          FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.FA.exponent + 32
+          FETCH.PAYLOAD.status.overflow := FETCH.PAYLOAD.result.exponent >= config.maxExponent
+        }
+        is(MicrocodeOp.EXPDEC32) {
+          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA
+          FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.FA.exponent - 32
+          FETCH.PAYLOAD.status.underflow := FETCH.PAYLOAD.result.exponent <= 0
+        }
+        is(MicrocodeOp.MULBY2) {
+          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA
+          FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.FA.exponent + 1
+          FETCH.PAYLOAD.status.overflow := FETCH.PAYLOAD.result.exponent >= config.maxExponent
+        }
+        is(MicrocodeOp.DIVBY2) {
+          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA
+          FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.FA.exponent - 1
+          FETCH.PAYLOAD.status.underflow := FETCH.PAYLOAD.result.exponent <= 0
+        }
+        is(MicrocodeOp.R32TOR64) {
+          FETCH.PAYLOAD.result := FloatData(config).fromBits(Cat(FETCH.PAYLOAD.FA.asBits(31 downto 0), B"0".resize(29)))
+        }
+        is(MicrocodeOp.R64TOR32) {
+          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(FETCH.PAYLOAD.FA.asBits(63 downto 29))
+        }
+        is(MicrocodeOp.NOROUND) {
+          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(FETCH.PAYLOAD.FA.asBits(63 downto 29))
+        }
+        is(MicrocodeOp.INTOP) {
+          val intPart = S(FETCH.PAYLOAD.FA.normalizedMantissa) << (FETCH.PAYLOAD.FA.exponent.toSInt - config.bias)
+          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(intPart.asBits.resize(config.totalWidth))
+        }
+        is(MicrocodeOp.REM) {
+          val temp = Reg(SInt(config.totalWidth bits))
+          when(FETCH.PAYLOAD.microPc === 1) {
+            temp := S(FETCH.PAYLOAD.FA.normalizedMantissa) << (FETCH.PAYLOAD.FA.exponent.toSInt - config.bias)
+          } elsewhen(FETCH.PAYLOAD.FA.exponent >= FETCH.PAYLOAD.FB.exponent) {
+            temp := temp - (S(FETCH.PAYLOAD.FB.normalizedMantissa) << (FETCH.PAYLOAD.FB.exponent.toSInt - config.bias))
+          }
+          FETCH.PAYLOAD.result := FETCH.PAYLOAD.FA.fromBits(temp.asBits.resize(config.totalWidth))
+          FETCH.PAYLOAD.status.inexact := True
+        }
+      }
+      FETCH.PAYLOAD.microPc := microInst.nextPc
+      when(FETCH.PAYLOAD.microPc =/= 0 && !(FETCH.PAYLOAD.opcode === FpuOperation.DIV || FETCH.PAYLOAD.opcode === FpuOperation.SQRT)) { haltIt() }
+      when(FETCH.PAYLOAD.opcode === FpuOperation.DIV || FETCH.PAYLOAD.opcode === FpuOperation.SQRT) {
+        when(dividerSqrtPlugin.logic.io.counterOut < (if (FETCH.PAYLOAD.opcode === FpuOperation.SQRT) config.mantissaWidth / 2 - 1 else config.mantissaWidth - 2)) { haltIt() }
+      }
+    }
+
+    val NORMALIZE = new pipeline.Ctrl(3) {
+      val shift = countLeadingZeros(FETCH.PAYLOAD.result.mantissa)
+      FETCH.PAYLOAD.result.mantissa := (FETCH.PAYLOAD.result.mantissa << shift)(config.mantissaWidth - 1 downto 0)
+      FETCH.PAYLOAD.result.exponent := FETCH.PAYLOAD.result.exponent - shift
+      FETCH.PAYLOAD.status.underflow := FETCH.PAYLOAD.result.exponent <= 0
+
+      dividerSqrtPlugin.logic.io.dividend := FETCH.PAYLOAD.FA
+      dividerSqrtPlugin.logic.io.divisor := FETCH.PAYLOAD.FB
+      dividerSqrtPlugin.logic.io.isSquareRoot := FETCH.PAYLOAD.opcode === FpuOperation.SQRT
+      dividerSqrtPlugin.logic.io.status := FETCH.PAYLOAD.status
+      dividerSqrtPlugin.logic.io.finalize := False
+      dividerSqrtPlugin.logic.io.partialRemainderIn := FETCH.PAYLOAD.tempA.asBits.asSInt
+      dividerSqrtPlugin.logic.io.quotientIn := FETCH.PAYLOAD.tempB.asBits.asUInt
+      dividerSqrtPlugin.logic.io.counterIn := dividerSqrtPlugin.logic.io.counterOut
+
+      when(FETCH.PAYLOAD.opcode === FpuOperation.DIV || FETCH.PAYLOAD.opcode === FpuOperation.SQRT) {
+        FETCH.PAYLOAD.result := dividerSqrtPlugin.logic.io.result
+        FETCH.PAYLOAD.tempA := FETCH.PAYLOAD.FA.fromBits(dividerSqrtPlugin.logic.io.partialRemainderOut.asBits.resize(config.totalWidth))
+        FETCH.PAYLOAD.tempB := FETCH.PAYLOAD.FA.fromBits(dividerSqrtPlugin.logic.io.quotientOut.asBits.resize(config.totalWidth))
+      }
+    }
+
+    val ROUND = new pipeline.Ctrl(4) {
+      val guard = FETCH.PAYLOAD.result.mantissa(1)
+      val roundBit = FETCH.PAYLOAD.result.mantissa(0)
+      val sticky = FETCH.PAYLOAD.result.mantissa(0)
+      val roundUp = FETCH.PAYLOAD.status.roundingMode.mux(
+        0 -> False,
+        1 -> (roundBit && (guard || sticky)),
+        2 -> (FETCH.PAYLOAD.result.sign && (guard || roundBit || sticky)),
+        3 -> (!FETCH.PAYLOAD.result.sign && (guard || roundBit || sticky))
+      )
+      FETCH.PAYLOAD.result.mantissa := FETCH.PAYLOAD.result.mantissa(config.mantissaWidth - 1 downto 2) + U(roundUp)
+      FETCH.PAYLOAD.status.inexact := guard || roundBit || sticky
+
+      dividerSqrtPlugin.logic.io.dividend := FETCH.PAYLOAD.FA
+      dividerSqrtPlugin.logic.io.divisor := FETCH.PAYLOAD.FB
+      dividerSqrtPlugin.logic.io.isSquareRoot := FETCH.PAYLOAD.opcode === FpuOperation.SQRT
+      dividerSqrtPlugin.logic.io.status := FETCH.PAYLOAD.status
+      dividerSqrtPlugin.logic.io.finalize := FETCH.PAYLOAD.opcode === FpuOperation.DIV || FETCH.PAYLOAD.opcode === FpuOperation.SQRT
+      dividerSqrtPlugin.logic.io.partialRemainderIn := FETCH.PAYLOAD.tempA.asBits.asSInt
+      dividerSqrtPlugin.logic.io.quotientIn := FETCH.PAYLOAD.tempB.asBits.asUInt
+      dividerSqrtPlugin.logic.io.counterIn := dividerSqrtPlugin.logic.io.counterOut
+
+      when(FETCH.PAYLOAD.opcode === FpuOperation.DIV || FETCH.PAYLOAD.opcode === FpuOperation.SQRT) {
+        FETCH.PAYLOAD.result := dividerSqrtPlugin.logic.io.result
+        FETCH.PAYLOAD.status := dividerSqrtPlugin.logic.io.outStatus
+      }
+    }
+
+    val WRITE = new pipeline.Ctrl(5) {
+      io.result := FETCH.PAYLOAD.result.asBits
+      io.ready := isValid
+      status := FETCH.PAYLOAD.status
+    }
+
+    io.specialResult := vcuPlugin.logic.io.result.asBits
+  }}
+}
+
+// Simulation
+object T9000FpuSim extends App {
+  SimConfig.withVerilator.compile(new T9000Fpu(FPUConfig(64))).doSim { dut =>
+    dut.clockDomain.forkStimulus(period = 10)
+    
+    // Test case: Subtract 0.5 from 1.0 (double precision)
+    dut.io.inputA #= 0x3FF0000000000000L  // 1.0
+    dut.io.inputB #= 0x3FE0000000000000L  // 0.5
+    dut.io.inputC #= 0x0000000000000000L  // 0.0 (unused)
+    dut.io.operation #= FpuOperation.SUB
+    dut.io.memAddress #= 0
+    
+    waitUntil(dut.io.ready.toBoolean)
+    println(s"Result: ${dut.io.result.toBigInt.toString(16)}")  // Expected: 0x3FE0000000000000 (0.5)
+    
+    // Test case: Divide 1.0 by 2.0 (double precision)
+    dut.io.inputA #= 0x3FF0000000000000L  // 1.0
+    dut.io.inputB #= 0x4000000000000000L  // 2.0
+    dut.io.operation #= FpuOperation.DIV
+    
+    waitUntil(dut.io.ready.toBoolean)
+    println(s"Divide Result: ${dut.io.result.toBigInt.toString(16)}")  // Expected: 0x3FE0000000000000 (0.5)
+    
+    // Test case: Square root of 4.0 (double precision)
+    dut.io.inputA #= 0x4010000000000000L  // 4.0
+    dut.io.inputB #= 0x0000000000000000L  // 0.0 (unused)
+    dut.io.operation #= FpuOperation.SQRT
+    
+    waitUntil(dut.io.ready.toBoolean)
+    println(s"Sqrt Result: ${dut.io.result.toBigInt.toString(16)}")  // Expected: 0x4000000000000000 (2.0)
+  }
 }
