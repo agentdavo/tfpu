@@ -135,9 +135,7 @@ object FpuDatabase {
     val updated = current ++ newOps
     println(s"Updating customOps for $key: $updated")
     customOps.set(updated)
-    // Example usage of updatesComplete() within the database
-    // This signals that an update has occurred; plugins can wait on it
-    updatesComplete() // Creates a RetainerHold, implicitly managed by await()
+    updatesComplete()
   }
 
   def updateMicrocodeSequences(key: FpuOperation.E, newSequences: Map[FpuOperation.E, Seq[MicrocodeInstruction]]): Unit = {
@@ -146,16 +144,14 @@ object FpuDatabase {
       return
     }
     val current = microcodeSequences.get
-    val filtered = newSequences.filter { case (k, v) => !current.contains(k) || current(k) == v }
+    val filtered = newSequences.filter { case (k, v) => !current.contains(k) || current(k) != v }
     val updated = current ++ filtered
     println(s"Updating microcodeSequences for $key: $updated")
     microcodeSequences.set(updated)
-    // Example usage of updatesComplete() within the database
-    updatesComplete() // Signals update completion
+    updatesComplete()
   }
 
-  // Optional: Method to explicitly wait for updates to complete
   def waitForUpdates(): Unit = {
-    updatesComplete.await() // Plugins or other code can call this to wait
+    updatesComplete.await()
   }
 }

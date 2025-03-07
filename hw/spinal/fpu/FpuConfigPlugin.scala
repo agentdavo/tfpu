@@ -1,29 +1,28 @@
 package fpu
 
 import spinal.core._
-import spinal.core.fiber._
 import spinal.lib._
-import spinal.lib.misc.plugin._
 import spinal.lib.misc.pipeline._
+import spinal.lib.misc.plugin._
+import spinal.core.fiber._
 
 class FpuConfigPlugin(override val config: FPUConfig, override val pipeline: Pipeline) extends FpuExecutionPlugin {
-  val logic = during setup new Area {
-    println("FpuConfigPlugin setup: Starting")
-    FpuGlobal.configSetup(config)
-    FpuDatabase.updatesComplete() // Signal initial microcode setup
-    awaitBuild()
-    println("FpuConfigPlugin setup: Completed")
-
+  override def build(): Unit = during setup {
     val io = new Bundle {
       val active = out Bool()
     }
-    io.active := False
+    this.io = io
 
-    def connectPayload(stage: Stage): Unit = {
-      stage(FpuGlobal.MICRO_PC) := 0 // Config plugin doesn't alter PC
+    io.active := False
+    FpuGlobal.configSetup(config)
+    FpuDatabase.updatesComplete()
+    awaitBuild()
+
+    def connectPayload(stage: Node): Unit = {
+      stage(FpuGlobal.MICRO_PC) := 0
     }
 
-    registerOperations(Map.empty) // Config plugin has no direct operations
+    registerOperations(Map.empty)
     registerMicrocode(FpuOperation.NONE, Seq(FpuDatabase.instr(MicrocodeOp.FINALIZE, 0, 0, 0, 0)))
   }
 }

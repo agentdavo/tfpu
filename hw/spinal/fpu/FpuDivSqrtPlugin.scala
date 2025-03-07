@@ -1,18 +1,13 @@
 package fpu
 
 import spinal.core._
-import spinal.core.fiber._
 import spinal.lib._
-import spinal.lib.misc.plugin._
 import spinal.lib.misc.pipeline._
+import spinal.lib.misc.plugin._
+import spinal.core.fiber._
 
 class DividerSqrtPlugin(override val config: FPUConfig, override val pipeline: Pipeline) extends FpuExecutionPlugin {
-  val logic = during setup new Area {
-    println("DividerSqrtPlugin setup: Starting")
-    FpuDatabase.updatesComplete()
-    awaitBuild()
-    println("DividerSqrtPlugin setup: Completed")
-
+  override def build(): Unit = during setup {
     val io = new Bundle {
       val result = out(new FloatData(config))
       val outStatus = out(new FPUStatus())
@@ -21,8 +16,8 @@ class DividerSqrtPlugin(override val config: FPUConfig, override val pipeline: P
       val counter = out(UInt(log2Up(config.mantissaWidth + 1) bits))
       val active = out Bool()
     }
+    this.io = io
 
-    // Connect to execute1 (stage 2) and execute2 (stage 3)
     val exec1Stage = pipeline.stages(2)
     val exec2Stage = pipeline.stages(3)
     io.result := exec2Stage(FpuGlobal.RESULT)
@@ -43,7 +38,7 @@ class DividerSqrtPlugin(override val config: FPUConfig, override val pipeline: P
       when(counter === 0) {
         partialRemainder := Mux(isSquareRoot, S(dividendMant), S(dividendMant) << (config.mantissaWidth + 1)).resize(extWidth)
         quotient := 0
-        exec1Stage(FpuGlobal.TempA).assignFromBits(partialRemainder.asBits.resize(config.totalWidth)) // Store initial remainder
+        exec1Stage(FpuGlobal.TempA).assignFromBits(partialRemainder.asBits.resize(config.totalWidth))
       } elsewhen(counter < Mux(isSquareRoot, U(config.mantissaWidth / 2), U(config.mantissaWidth))) {
         val rShifted = partialRemainder << 2
         val qLastBits = quotient.resize(counter.getWidth bits)
@@ -54,7 +49,7 @@ class DividerSqrtPlugin(override val config: FPUConfig, override val pipeline: P
         val product = (qDigit.abs * trialDivisor).asSInt
         partialRemainder := rShifted - product
         quotient := (quotient << 2) | qDigit.abs
-        exec2Stage(FpuGlobal.TempB).assignFromBits(quotient.asBits.resize(config.totalWidth)) // Store intermediate quotient
+        exec2Stage(FpuGlobal.TempB).assignFromBits(quotient.asBits.resize(config.totalWidth))
       }
       counter := counter + 1
       exec1Stage(FpuGlobal.INTERMEDIATE).partialRemainder := partialRemainder
@@ -82,12 +77,11 @@ class DividerSqrtPlugin(override val config: FPUConfig, override val pipeline: P
     io.quotient := quotient
     io.counter := counter
 
-    def connectPayload(stage: Stage): Unit = {
+    def connectPayload(stage: Node): Unit = {
       stage(FpuGlobal.MICRO_PC) := io.microInst.nextPc
     }
 
     registerOperations(Map("DIV" -> FpuOperation.DIV, "SQRT" -> FpuOperation.SQRT, "REM" -> FpuOperation.REM))
-    // Adjusted to match T9000: 7 cycles for single-precision DIV/SQRT, 15 for double-precision
     val divSeq = if (config.isSinglePrecision)
       Seq(
         FpuDatabase.instr(MicrocodeOp.DIV, 1, 2, 1, 1),
@@ -116,12 +110,11 @@ class DividerSqrtPlugin(override val config: FPUConfig, override val pipeline: P
         FpuDatabase.instr(MicrocodeOp.DIV, 1, 2, 1, 14),
         FpuDatabase.instr(MicrocodeOp.NORM, 1, 0, 1, 0)
       )
-    val sqrtSeq = divSeq // SQRT follows same cycle count as DIV
+    val sqrtSeq = divSeq
     val remSeq = divSeq
-    registerMicrocode(FpuOperation.DIV, Map(
-      FpuOperation.DIV -> divSeq,
-      FpuOperation.SQRT -> sqrtSeq,
-      FpuOperation.REM -> remSeq
-    ))
+    registerMicrocode(FpuOperation.DIV, divSeq)
+    registerMicrocode(FpuOperation.SQRT, sqrtSeq)
+    registerMicrocode(FpuOperation.REM, remSeq)
+    awaitBuild()
   }
 }

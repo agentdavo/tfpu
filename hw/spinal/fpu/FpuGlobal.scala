@@ -1,11 +1,11 @@
 package fpu
 
 import spinal.core._
-import spinal.lib.misc.database.Database.blocking
+import spinal.lib._
 import spinal.lib.misc.pipeline.Payload
+import spinal.core.fiber.Database.blocking
 
 object FpuGlobal extends AreaRoot {
-  // Elaboration-time constants
   val MANTISSA_WIDTH = blocking[Int]
   val EXPONENT_WIDTH = blocking[Int]
   val TOTAL_WIDTH = blocking[Int]
@@ -14,7 +14,6 @@ object FpuGlobal extends AreaRoot {
   val CLOCK_FREQ_MHZ = blocking[Int]
   val IS_SINGLE_PRECISION = blocking[Boolean]
 
-  // Pipeline payloads
   val FA = Payload(FloatData(FPUConfig(64)))
   val FB = Payload(FloatData(FPUConfig(64)))
   val FC = Payload(FloatData(FPUConfig(64)))

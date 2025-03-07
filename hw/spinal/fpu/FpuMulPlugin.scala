@@ -1,15 +1,17 @@
 package fpu
 
 import spinal.core._
-import spinal.core.fiber._
 import spinal.lib._
 import spinal.lib.misc.pipeline._
+import spinal.lib.misc.plugin._
+import spinal.core.fiber._
 
 class MultiplierPlugin(override val config: FPUConfig, override val pipeline: Pipeline) extends FpuExecutionPlugin {
-  val logic = during setup new Area {
-    println("MultiplierPlugin setup: Starting")
-    FpuDatabase.updatesComplete()
-    awaitBuild()
+  override def build(): Unit = during setup {
+    val io = new Bundle {
+      val active = out Bool()
+    }
+    this.io = io
 
     val stageReg = Reg(UInt(2 bits)) init(0)
     val partialProducts = Reg(Vec(UInt(config.mantissaWidth * 2 + 4 bits), config.mantissaWidth / 2 + 2))
@@ -24,12 +26,12 @@ class MultiplierPlugin(override val config: FPUConfig, override val pipeline: Pi
     }
 
     io.active := io.microInst.op === MicrocodeOp.MUL
-
     when(io.active) {
       switch(stageReg) {
-        is(0) { // Execute1: Booth recoding and partial product generation
-          val mantAExt = Cat(B"1", pipeline(FpuGlobal.FA).mantissa).asUInt
-          val mantBExt = Cat(B"1", pipeline(FpuGlobal.FB).mantissa).asUInt
+        is(0) {
+          val exec1Stage = pipeline.stages(2)
+          val mantAExt = Cat(B"1", exec1Stage(FpuGlobal.FA).mantissa).asUInt
+          val mantBExt = Cat(B"1", exec1Stage(FpuGlobal.FB).mantissa).asUInt
           val boothDigits = Vec(SInt(2 bits), config.mantissaWidth / 2 + 1)
           for (i <- 0 until config.mantissaWidth / 2 + 1) {
             val bits = Cat(
@@ -55,14 +57,15 @@ class MultiplierPlugin(override val config: FPUConfig, override val pipeline: Pi
             }
           }
 
-          sign := pipeline(FpuGlobal.FA).sign ^ pipeline(FpuGlobal.FB).sign
-          exp := pipeline(FpuGlobal.FA).exponent + pipeline(FpuGlobal.FB).exponent - config.bias
+          sign := exec1Stage(FpuGlobal.FA).sign ^ exec1Stage(FpuGlobal.FB).sign
+          exp := exec1Stage(FpuGlobal.FA).exponent + exec1Stage(FpuGlobal.FB).exponent - config.bias
           partialSum(0) := 0
           partialSum(1) := 0
-          pipeline(FpuGlobal.TempA).assignFromBits(B(0, config.totalWidth bits)) // TempA for intermediates
+          exec1Stage(FpuGlobal.TempA).assignFromBits(B(0, config.totalWidth bits))
           stageReg := 1
         }
-        is(1) { // Execute2: Carry-save reduction
+        is(1) {
+          val exec2Stage = pipeline.stages(3)
           val maxArraySize = 7
           val array1 = partialProducts.take(maxArraySize).toSeq
           val array2 = partialProducts.drop(maxArraySize).take(maxArraySize).toSeq
@@ -85,29 +88,29 @@ class MultiplierPlugin(override val config: FPUConfig, override val pipeline: Pi
 
           partialSum(0) := finalSum
           partialSum(1) := finalCarry
-          pipeline(FpuGlobal.TempB).assignFromBits(finalSum.asBits.resize(config.totalWidth)) // Store in TempB
+          exec2Stage(FpuGlobal.TempB).assignFromBits(finalSum.asBits.resize(config.totalWidth))
           stageReg := 2
         }
-        is(2) { // Normalize stage handles final result
+        is(2) {
+          val normalizeStage = pipeline.stages(4)
           val pFull = partialSum(0) + partialSum(1)
-          pipeline(FpuGlobal.RESULT).sign := sign
-          pipeline(FpuGlobal.RESULT).exponent := exp
-          pipeline(FpuGlobal.RESULT).mantissa := pFull(config.mantissaWidth * 2 + 1 downto config.mantissaWidth + 2).asUInt
-          pipeline(FpuGlobal.INTERMEDIATE).partialProducts := partialProducts
-          pipeline(FpuGlobal.INTERMEDIATE).partialSum := partialSum
-          pipeline(FpuGlobal.STATUS) := pipeline(FpuGlobal.STATUS)
+          normalizeStage(FpuGlobal.RESULT).sign := sign
+          normalizeStage(FpuGlobal.RESULT).exponent := exp
+          normalizeStage(FpuGlobal.RESULT).mantissa := pFull(config.mantissaWidth * 2 + 1 downto config.mantissaWidth + 2).asUInt
+          normalizeStage(FpuGlobal.INTERMEDIATE).partialProducts := partialProducts
+          normalizeStage(FpuGlobal.INTERMEDIATE).partialSum := partialSum
+          normalizeStage(FpuGlobal.STATUS) := normalizeStage(FpuGlobal.STATUS)
           stageReg := 0
         }
       }
     }
 
-    def connectPayload(stage: Stage): Unit = {
+    def connectPayload(stage: Node): Unit = {
       stage(FpuGlobal.MICRO_PC) := io.microInst.nextPc
       when(io.active && io.microInst.nextPc =/= 0) { stage.haltIt() }
     }
 
     registerOperations(Map("MUL" -> FpuOperation.MUL, "LDNLMULSN" -> FpuOperation.LDNLMULSN, "LDNLMULDB" -> FpuOperation.LDNLMULDB))
-    // Adjusted to match T9000: 2 cycles for single-precision MUL, 3 for double-precision
     val mulSeq = if (config.isSinglePrecision)
       Seq(
         FpuDatabase.instr(MicrocodeOp.MUL, 1, 2, 1, 1),
@@ -131,5 +134,6 @@ class MultiplierPlugin(override val config: FPUConfig, override val pipeline: Pi
       FpuDatabase.instr(MicrocodeOp.MUL, 1, 4, 1, 2),
       FpuDatabase.instr(MicrocodeOp.NORM, 1, 0, 1, 0)
     ))
+    awaitBuild()
   }
 }

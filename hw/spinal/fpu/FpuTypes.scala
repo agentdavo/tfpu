@@ -2,6 +2,8 @@ package fpu
 
 import spinal.core._
 import spinal.lib._
+import spinal.lib.misc.pipeline._
+import spinal.lib.misc.plugin.FiberPlugin
 
 case class FloatData(config: FPUConfig) extends Bundle {
   val sign = Bool()
@@ -59,9 +61,12 @@ trait FpuExecutionPlugin extends FiberPlugin {
   val config: FPUConfig
   val pipeline: Pipeline
 
-  val io = new Bundle {
-    val microInst = in(MicrocodeInstruction())
-    val active = out Bool() // Signals this plugin is handling the operation
+  override def build(): Unit = during setup {
+    val io = new Bundle {
+      val microInst = in(MicrocodeInstruction())
+      val active = out Bool()
+    }
+    this.io = io
   }
 
   def registerOperations(ops: Map[String, FpuOperation.E]): Unit = {
@@ -72,7 +77,7 @@ trait FpuExecutionPlugin extends FiberPlugin {
     FpuDatabase.updateMicrocodeSequences(op, Map(op -> seq))
   }
 
-  def connectPayload(stage: Stage): Unit // Connects plugin logic to pipeline stage
+  def connectPayload(stage: Node): Unit // Updated to Node from Stage
 }
 
 object FpuOperation extends SpinalEnum {
@@ -95,7 +100,7 @@ case class MicrocodeInstruction() extends Bundle {
   val nextPc = UInt(6 bits)
 }
 
-class FpuIntermediateState(config: FPUConfig) extends Bundle {
+case class FpuIntermediateState(config: FPUConfig) extends Bundle {
   val tempA = new FloatData(config)
   val tempB = new FloatData(config)
   val partialProducts = Vec(UInt(config.mantissaWidth * 2 + 4 bits), config.mantissaWidth / 2 + 2)
@@ -121,8 +126,8 @@ object DefaultFpuIntermediateState extends FpuIntermediateStateExtension[Default
 }
 
 case class TrapInterface() extends Bundle {
-  val trapEnable = Bool() // Indicates whether a trap is enabled
-  val trapCause = UInt(8 bits) // 8-bit field to encode the cause of the trap (e.g., unalign, access violation)
+  val trapEnable = Bool()
+  val trapCause = UInt(8 bits)
 }
 
 case class FpuPayload[T <: FpuIntermediateState](config: FPUConfig, intermediateFactory: FPUConfig => T) extends Bundle {

@@ -1,27 +1,22 @@
 package fpu
 
 import spinal.core._
-import spinal.core.fiber._
 import spinal.lib._
-import spinal.lib.misc.plugin._
 import spinal.lib.misc.pipeline._
+import spinal.lib.misc.plugin._
+import spinal.core.fiber._
 
 class NormalizerPlugin(override val config: FPUConfig, override val pipeline: Pipeline) extends FpuExecutionPlugin {
-  val logic = during setup new Area {
-    println("NormalizerPlugin setup: Starting")
-    FpuDatabase.updatesComplete()
-    awaitBuild()
-    println("NormalizerPlugin setup: Completed")
-
+  override def build(): Unit = during setup {
     val io = new Bundle {
-      val resultIn = in(new FloatData(config)) // Raw product or intermediate result
-      val statusIn = in(new FPUStatus())       // Includes roundingMode
+      val resultIn = in(new FloatData(config))
+      val statusIn = in(new FPUStatus())
       val resultOut = out(new FloatData(config))
       val statusOut = out(new FPUStatus())
       val active = out Bool()
     }
+    this.io = io
 
-    // Connect to the normalize stage (stage 4)
     val normalizeStage = pipeline.stages(4)
     io.resultIn := normalizeStage(FpuGlobal.RESULT)
     io.statusIn := normalizeStage(FpuGlobal.STATUS)
@@ -30,14 +25,13 @@ class NormalizerPlugin(override val config: FPUConfig, override val pipeline: Pi
     when(normalizeStage.isValid && normalizeStage(FpuGlobal.MICRO_PC) =/= 0 && io.microInst.op === MicrocodeOp.NORM) {
       io.active := True
 
-      // Denormal handling: Shift mantissa to normalize, adjust exponent
       val isDenormal = io.resultIn.isDenormal
       val shiftCount = Reg(UInt(log2Up(config.mantissaWidth + 1) bits)) init(0)
       val denormalState = Reg(Bool()) init(False)
 
       when(isDenormal && !denormalState) {
         // First pass: Calculate leading zeros and store intermediate in TempA
-        val leadingZeros = OHToUInt(OHMasking.first(io.resultIn.mantissa)) // Count leading zeros
+        val leadingZeros = OHToUInt(OHMasking.first(io.resultIn.mantissa))
         shiftCount := leadingZeros
         normalizeStage(FpuGlobal.TempA).mantissa := io.resultIn.mantissa |<< leadingZeros
         normalizeStage(FpuGlobal.TempA).exponent := io.resultIn.exponent - leadingZeros
@@ -84,16 +78,14 @@ class NormalizerPlugin(override val config: FPUConfig, override val pipeline: Pi
         val stickyShifted = pFull(config.mantissaWidth - 4 downto 0) =/= 0
 
         val roundUpNoShift = io.statusIn.roundingMode.mux(
-          0 -> (guardNoShift && (roundNoShift || stickyNoShift) || // Nearest-Even
-                (guardNoShift && roundNoShift && !stickyNoShift && pNoShiftFull(0))), // Tie to even
+          0 -> (guardNoShift && (roundNoShift || stickyNoShift) || (guardNoShift && roundNoShift && !stickyNoShift && pNoShiftFull(0))), // Nearest-Even
           1 -> False, // Toward Zero
           2 -> (guardNoShift && !inputSign), // Toward +Infinity
           3 -> (guardNoShift && inputSign) // Toward -Infinity
         )
 
         val roundUpShifted = io.statusIn.roundingMode.mux(
-          0 -> (guardShifted && (roundShifted || stickyShifted) || // Nearest-Even
-                (guardShifted && roundShifted && !stickyShifted && pShiftedFull(0))), // Tie to even
+          0 -> (guardShifted && (roundShifted || stickyShifted) || (guardShifted && roundShifted && !stickyShifted && pShiftedFull(0))), // Nearest-Even
           1 -> False, // Toward Zero
           2 -> (guardShifted && !inputSign), // Toward +Infinity
           3 -> (guardShifted && inputSign) // Toward -Infinity
@@ -109,12 +101,12 @@ class NormalizerPlugin(override val config: FPUConfig, override val pipeline: Pi
         val expAdjust = Mux(needsShift, U(1), U(0))
         val expResult = inputExponent + expAdjust
 
-        normalizeStage(FpuGlobal.RESULT).sign := inputSign
-        normalizeStage(FpuGlobal.RESULT).exponent := expResult
-        normalizeStage(FpuGlobal.RESULT).mantissa := mantissa(config.mantissaWidth - 1 downto 0)
-        normalizeStage(FpuGlobal.STATUS).overflow := expResult >= config.maxExponent
-        normalizeStage(FpuGlobal.STATUS).underflow := expResult <= 0
-        normalizeStage(FpuGlobal.STATUS).inexact := Mux(needsShift, guardShifted | stickyShifted, guardNoShift | stickyNoShift)
+        io.resultOut.sign := inputSign
+        io.resultOut.exponent := expResult
+        io.resultOut.mantissa := mantissa(config.mantissaWidth - 1 downto 0)
+        io.statusOut.overflow := expResult >= config.maxExponent
+        io.statusOut.underflow := expResult <= 0
+        io.statusOut.inexact := Mux(needsShift, guardShifted | stickyShifted, guardNoShift | stickyNoShift)
 
         // Reset denormal state after processing
         when(!isDenormal || denormalState) {
@@ -124,13 +116,14 @@ class NormalizerPlugin(override val config: FPUConfig, override val pipeline: Pi
       }
     }
 
-    def connectPayload(stage: Stage): Unit = {
+    def connectPayload(stage: Node): Unit = {
       stage(FpuGlobal.MICRO_PC) := io.microInst.nextPc
       io.resultOut := stage(FpuGlobal.RESULT)
       io.statusOut := stage(FpuGlobal.STATUS)
     }
 
-    registerOperations(Map("NORM" -> FpuOperation.NONE)) // NORM is a supporting op, tied to arithmetic ops
+    registerOperations(Map("NORM" -> FpuOperation.NONE))
     registerMicrocode(FpuOperation.NONE, Seq(FpuDatabase.instr(MicrocodeOp.NORM, 1, 0, 1, 0)))
+    awaitBuild()
   }
 }

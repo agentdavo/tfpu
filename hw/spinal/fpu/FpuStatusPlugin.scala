@@ -1,18 +1,13 @@
 package fpu
 
 import spinal.core._
-import spinal.core.fiber._
 import spinal.lib._
-import spinal.lib.misc.plugin._
 import spinal.lib.misc.pipeline._
+import spinal.lib.misc.plugin._
+import spinal.core.fiber._
 
 class StatusPlugin(override val config: FPUConfig, override val pipeline: Pipeline) extends FpuExecutionPlugin {
-  val logic = during setup new Area {
-    println("StatusPlugin setup: Starting")
-    FpuDatabase.updatesComplete()
-    awaitBuild()
-    println("StatusPlugin setup: Completed")
-
+  override def build(): Unit = during setup {
     val io = new Bundle {
       val faIn = in(new FloatData(config))
       val statusIn = in(new FPUStatus())
@@ -20,8 +15,8 @@ class StatusPlugin(override val config: FPUConfig, override val pipeline: Pipeli
       val statusOut = out(new FPUStatus())
       val active = out Bool()
     }
+    this.io = io
 
-    // Connect to any stage (e.g., execute1 for flexibility)
     val execStage = pipeline.stages(2)
     io.faIn := execStage(FpuGlobal.FA)
     io.statusIn := execStage(FpuGlobal.STATUS)
@@ -46,7 +41,7 @@ class StatusPlugin(override val config: FPUConfig, override val pipeline: Pipeli
       when(io.microInst.nextPc =/= 0) { execStage.haltIt() }
     }
 
-    def connectPayload(stage: Stage): Unit = {
+    def connectPayload(stage: Node): Unit = {
       stage(FpuGlobal.MICRO_PC) := io.microInst.nextPc
     }
 
@@ -64,5 +59,6 @@ class StatusPlugin(override val config: FPUConfig, override val pipeline: Pipeli
     registerMicrocode(FpuOperation.TESTERR, Seq(FpuDatabase.instr(MicrocodeOp.TESTERR, 0, 0, 0, 0)))
     registerMicrocode(FpuOperation.SETERR, Seq(FpuDatabase.instr(MicrocodeOp.SETERR, 0, 0, 0, 0)))
     registerMicrocode(FpuOperation.CLRERR, Seq(FpuDatabase.instr(MicrocodeOp.CLRERR, 0, 0, 0, 0)))
+    awaitBuild()
   }
 }
